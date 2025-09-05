@@ -24,10 +24,12 @@ void VoxVcoCore::reset() {
     }
 }
 
-// NOTE: We assume your template's Params provides:
-// - p.pitchVolts (V/Oct in volts)
-// - p.macros[0..3] in [0..1] (centered macros may be mapped by wrapper to [-1..1])
-// If your template differs, remap here (safe centralization).
+// Params mapping:
+// - pitchVolts: true 1 V/oct (0V=C4)
+// - Macro A: pitch offset (±12 semis) -> P_.macroA in [-1..+1]
+// - Macro B: morph (your UI 0..2) -> normalized to [0..1]
+// - Macro C: unison/spread [0..1]
+// - Macro D: timbre / FM index [0..1] (sqrt curve for hotter top)
 void VoxVcoCore::setParams(const IDspCore::Params& p) {
     // ---- Pitch (V/Oct) ----
     P_.pitchVolts = p.pitchVolts; // OK if 0.0 when wrapper doesn't provide it
@@ -38,20 +40,20 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
 
     if (!macrosProvided) {
         m[0] = p.dryWet; // Macro A
-        m[1] = p.gain;   // Macro B
+        m[1] = p.gain;   // Macro B (note: your UI uses 0..2)
         m[2] = p.tone;   // Macro C
         m[3] = p.macro;  // Macro D
     }
 
-    // Clamp to [0..1]
+    // Map & clamp
     const double mA = fast_clip(m[0], 0.0, 1.0);
-    const double mB = fast_clip(m[1], 0.0, 1.0);
+    const double mB_raw = fast_clip(m[1], 0.0, 2.0); // accept UI's 0..2
+    const double mB_norm = mB_raw * 0.5;             // normalize to 0..1 for the core
     const double mC = fast_clip(m[2], 0.0, 1.0);
     const double mD = fast_clip(m[3], 0.0, 1.0);
 
-    // Map to our internal roles
     P_.macroA = mA * 2.0 - 1.0;  // [-1..+1] → ±12 semis inside process
-    P_.macroB = mB;              // morph 0..1
+    P_.macroB = mB_norm;         // morph 0..1
     P_.macroC = mC;              // unison/spread 0..1
     P_.macroD = mD;              // timbre / FM index 0..1
 
@@ -66,8 +68,7 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     pwmWidth_ = 0.05 + 0.90 * P_.macroD;
     foldAmt_  = P_.macroD;
     chaosAmt_ = P_.macroD;
-    fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // FM index (0..1) — make the top half much stronger
-
+    fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // hotter top
 
     stereoWidth_ = 0.1 + 0.9 * P_.macroC;
     detuneSpreadCents_ = 30.0 * P_.macroC;
@@ -114,28 +115,31 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     double saw = 2.0 * t - 1.0;
     saw -= poly_blep(t, std::fabs(dt));
 
-    // Square (PWM, polyBLEP at both edges)
-    double w = fast_clip(timbre01 * 0.90 + 0.05, 0.05, 0.95);
+    // PWM Square (polyBLEP at both edges)
+    const double w = fast_clip(timbre01 * 0.90 + 0.05, 0.05, 0.95);
     double sq = (t < w ? 1.0 : -1.0);
     sq += poly_blep(t, std::fabs(dt));
-    // second edge at w
-    double tw = t - w;
-    if (tw < 0.0) tw += 1.0;
+    double tw = t - w; if (tw < 0.0) tw += 1.0;
     sq -= poly_blep(tw, std::fabs(dt));
-
     outSquareForTri = sq;
 
-    // Triangle: integrate BL square with leaky integrator
-    // y[n] = y[n-1] + k * (sq - y[n-1]), with k ~ dt * 2 + small bias
-    const double k = fast_clip(std::fabs(dt) * 2.0 + 1e-6, 1e-6, 1.0);
-    triState += k * (sq - triState);
-    double tri = triState;
+    // Triangle via exact integration of a 50% BLEP square
+    // Build bandlimited 50% duty square
+    double sq50 = (t < 0.5 ? 1.0 : -1.0);
+    sq50 += poly_blep(t, std::fabs(dt));
+    double t2 = t - 0.5; if (t2 < 0.0) t2 += 1.0;
+    sq50 -= poly_blep(t2, std::fabs(dt));
+    // Integrate: tri[n] = tri[n-1] + (2*dt) * sq50  (works with signed dt for TZ)
+    triState += (2.0 * dt) * sq50;
+    // tiny clamp to prevent numerical creep
+    if (triState > 1.2) triState = 1.2;
+    else if (triState < -1.2) triState = -1.2;
+    const double tri = triState;
 
     // Sine
     const double sine = std::sin(2.0 * M_PI * t);
 
-    // Folded/chaotic core: start from sine, fold with tanh (or cubic softclip),
-    // then add a faint highpass to remove DC.
+    // Folded/chaotic core: start from sine, fold with tanh (or cubic softclip)
 #if 1
     const double folded = std::tanh( (1.0 + 4.0 * timbre01) * sine );
 #else
@@ -158,8 +162,6 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
         case 3: // PWM Square -> Folded/Chaotic (depth from timbre01)
         {
             const double fold = folded;
-            // Blend toward a very mild chaotic flavor by adding tiny feedback-ish term
-            // The caller can add HP later; here just crossfade.
             y = morphMix(sq, fold, zf);
             break;
         }
@@ -173,7 +175,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     if (!outL || !outR || n <= 0) return;
 
     // Detect FM cable if wrapper doesn't provide it: measure RMS over the block
-    // (lightweight). Use this only if wrapper didn't set fmCablePresent.
     bool fmCableInfer = false;
     if (!P_.fmCable && inR) {
         double accum = 0.0;
@@ -190,16 +191,13 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     const double baseHz = fast_clip(kC4 * std::pow(2.0, P_.pitchVolts + semis / 12.0), kMinHz, kMaxHz);
 
     // Precompute per-voice pan positions and detunes
-    // Symmetric pan [0..1]
     double panPos[kMaxUnison] = {0};
-    // Symmetric detune in cents
     double detC[kMaxUnison] = {0};
 
     if (unisonCount_ == 1) {
         panPos[0] = 0.5;
         detC[0] = 0.0;
     } else {
-        // Spread voices across stereo; center stays near 0.5 for odd counts
         for (int i = 0; i < unisonCount_; ++i) {
             const double idx01 = (unisonCount_ <= 1) ? 0.5 : double(i) / double(unisonCount_ - 1);
             const double centered = (idx01 - 0.5);
@@ -216,11 +214,14 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     prevSync_ = (n > 0 && inL) ? inL[n - 1] : prevSync_;
 
     for (int i = 0; i < n; ++i) {
-        // Rising edge on IN L triggers hard sync
-        bool hardSync = false;
+        // Sync detection (shared left input):
+        // - Hard: rising past ~+2 V
+        // - Soft: rising zero-crossing (bipolar signals)
+        bool hardSync = false, softSync = false;
         if (inL) {
             const float s = inL[i];
-            hardSync = (prevSync <= 1.0f && s > 1.0f);
+            hardSync = (prevSync <= 2.0f && s > 2.0f);
+            softSync = (prevSync <= 0.0f && s > 0.0f);
             prevSync = s;
         }
 
@@ -246,24 +247,25 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             if (fmEnabled_) {
                 double norm = fast_clip(fmSample / 5.0, -1.0, 1.0);
                 // Hybrid FM depth: mostly absolute (Hz), plus a bit relative to base
-                // - Absolute part gives wide sidebands on low notes
-                // - Relative part keeps FM audible at higher notes
                 const double absHz = kFmMaxHz * fmIndex_;
                 const double relHz = baseHz * (1.5 * fmIndex_);   // up to ~1.5× base at full
                 const double devHz = absHz * 0.7 + relHz * 0.3;
-
                 f += devHz * norm;
             }
             f = fast_clip(f, -kMaxHz, kMaxHz); // allow negative (through-zero)
 
             const double dt = f * invSr_;
 
-            // Hard sync: reset phase with BLEP correction
+            // Hard/soft sync handling
             if (hardSync) {
-                // reset near zero; polyBLEP will smooth on next sample
-                V.phase = 0.0;
-                // reset triangle integrator to avoid click
-                V.triI *= 0.5;
+                V.phase = 0.0;   // hard reset
+                V.triI *= 0.5;   // tame integrator click
+            } else if (softSync) {
+                // gentle pull of phase toward 0 without discontinuity
+                const double k = 0.20;
+                V.phase -= k * V.phase;
+                if (V.phase < 0.0) V.phase += 1.0;
+                else if (V.phase >= 1.0) V.phase -= 1.0;
             }
 
             // Wave render
@@ -282,8 +284,7 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
             // Advance phase (through-zero OK)
             V.phase += dt;
-            // Wrap to [0,1)
-            V.phase -= std::floor(V.phase);
+            V.phase -= std::floor(V.phase); // wrap to [0,1)
         }
 
         // Normalize by voice count and scale to target volts
@@ -297,7 +298,7 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         outR[i] = float(yR * kOutGain);
     }
 
-    // store prevSync
+    // store prevSync across blocks
     prevSync_ = prevSync;
 }
 
