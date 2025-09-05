@@ -102,69 +102,76 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
                               double timbre01, double& triState,
                               double& outSquareForTri) const
 {
-    // Map morph01 [0..1] to zones 0..4
+    // Map morph01 [0..1] to zones 0..4, clamp to last zone
     const double morph4 = morph01 * 4.0;
-    const int zone = (int)std::floor(morph4);
-    const double zf = morph4 - zone; // in-zone morph [0..1]
+    int zone = (int)std::floor(morph4);
+    if (zone > 3) zone = 3;          // avoid zone==4 wrap
+    const double zf = morph4 - std::floor(morph4); // in-zone morph [0..1)
 
     // Basic phasor
     double t = phase; // [0,1)
+    const double dtAbs = std::fabs(dt);
 
-    // --- Primitive waveforms (bandlimited) ---
+    // ---------- Primitives ----------
     // Saw (polyBLEP)
     double saw = 2.0 * t - 1.0;
-    saw -= poly_blep(t, std::fabs(dt));
+    saw -= poly_blep(t, dtAbs);
 
-    // PWM Square (polyBLEP at both edges)
+    // PWM Square (polyBLEP at both edges); TIMBRE = duty in this region
     const double w = fast_clip(timbre01 * 0.90 + 0.05, 0.05, 0.95);
     double sq = (t < w ? 1.0 : -1.0);
-    sq += poly_blep(t, std::fabs(dt));
+    sq += poly_blep(t, dtAbs);
     double tw = t - w; if (tw < 0.0) tw += 1.0;
-    sq -= poly_blep(tw, std::fabs(dt));
+    sq -= poly_blep(tw, dtAbs);
     outSquareForTri = sq;
 
-    // Triangle via exact integration of a 50% BLEP square
-    // Build bandlimited 50% duty square
+    // 50% duty BL square for triangle integration (amplitude-stable)
     double sq50 = (t < 0.5 ? 1.0 : -1.0);
-    sq50 += poly_blep(t, std::fabs(dt));
+    sq50 += poly_blep(t, dtAbs);
     double t2 = t - 0.5; if (t2 < 0.0) t2 += 1.0;
-    sq50 -= poly_blep(t2, std::fabs(dt));
-    // Integrate: tri[n] = tri[n-1] + (2*dt) * sq50  (works with signed dt for TZ)
+    sq50 -= poly_blep(t2, dtAbs);
+
+    // Triangle by exact integration; works with signed dt (TZFM)
     triState += (2.0 * dt) * sq50;
-    // tiny clamp to prevent numerical creep
-    if (triState > 1.2) triState = 1.2;
-    else if (triState < -1.2) triState = -1.2;
+    if (triState > 1.2) triState = 1.2; else if (triState < -1.2) triState = -1.2;
     const double tri = triState;
 
-    // Sine
-    const double sine = std::sin(2.0 * M_PI * t);
+    // Sine and a phase-distorted sine driven by TIMBRE
+    const double theta = 2.0 * M_PI * t;
+    const double sine  = std::sin(theta);
+    double ph = t + 0.25 * timbre01 * std::sin(theta); // warp phase; 0..1 wrap
+    ph -= std::floor(ph);
+    const double sinePD = std::sin(2.0 * M_PI * ph);
 
-    // Folded/chaotic core: start from sine, fold with tanh (or cubic softclip)
+    // Triangle curvature (TIMBRE increases odd-harm content gently)
+    const double triShaped = tri * (1.0 - timbre01) + std::tanh(tri * (1.0 + 3.0 * timbre01)) * timbre01;
+
+    // Folded/chaotic core (depth from TIMBRE)
 #if 1
     const double folded = std::tanh( (1.0 + 4.0 * timbre01) * sine );
 #else
     const double folded = softclip3((1.0 + 4.0 * timbre01) * sine);
 #endif
 
-    // --- Morph zones ---
+    // ---------- Morph zones ----------
     double y = 0.0;
     switch (zone) {
         default:
-        case 0: // Sine -> Triangle
-            y = morphMix(sine, tri, zf);
+        case 0: // Sine -> Triangle  (timbre = PD on sine)
+            y = morphMix(sinePD, tri, zf);
             break;
-        case 1: // Triangle -> Saw
-            y = morphMix(tri, saw, zf);
+
+        case 1: // Triangle -> Saw   (timbre = curvature on triangle)
+            y = morphMix(triShaped, saw, zf);
             break;
-        case 2: // Saw -> PWM Square (duty uses timbre01 already)
+
+        case 2: // Saw -> PWM Square (timbre = PWM duty already applied)
             y = morphMix(saw, sq, zf);
             break;
-        case 3: // PWM Square -> Folded/Chaotic (depth from timbre01)
-        {
-            const double fold = folded;
-            y = morphMix(sq, fold, zf);
+
+        case 3: // PWM Square -> Folded/Chaotic (timbre = fold depth)
+            y = morphMix(sq, folded, zf);
             break;
-        }
     }
     return y;
 }
