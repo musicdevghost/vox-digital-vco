@@ -1,20 +1,16 @@
 {
-  "slug": "vm-vox-audio",
+  "slug": "voxvco",
   "version": "2.0.0",
   "license": "proprietary",
   "brand": "Voxmachina",
-  "name": "VoxAudio",
   "author": "Voxmachina",
+  "name": "Vox Template Pack",
   "modules": [
     {
-      "slug": "vox-audio",
-      "name": "VoxAudio",
-      "description": "Voxmachina audio template module (stereo).",
-      "tags": [
-        "Effect",
-        "Utility",
-        "Template"
-      ]
+      "slug": "vox-vco",
+      "name": "Vox VCO",
+      "description": "Distinctive oscillator: unison drift, TZFM, BLEP shapes, morph path, stereo spread.",
+      "tags": [ "Oscillator", "Digital", "FM", "Stereo" ]
     }
   ]
 }

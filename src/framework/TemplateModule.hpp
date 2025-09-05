@@ -14,25 +14,25 @@ struct VoxTemplateModule : rack::engine::Module {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 
         // Params
-        configParam(PARAM_DRYWET, 0.f, 1.f, 0.5f, "Dry/Wet");
-        configParam(PARAM_GAIN,   0.f, 2.f, 1.0f, "Gain");
-        configParam(PARAM_TONE,   0.f, 1.f, 0.5f, "Tone");
-        configParam(PARAM_MACRO,  0.f, 1.f, 0.0f, "Macro");
+        configParam(PARAM_PITCH, 0.f, 1.f, 0.5f, "Pitch");
+        configParam(PARAM_MORPH,   0.f, 2.f, 1.0f, "Morph");
+        configParam(PARAM_SPREAD,   0.f, 1.f, 0.5f, "Spread");
+        configParam(PARAM_TIMBRE,  0.f, 1.f, 0.0f, "Timbre");
 
-        configParam(PARAM_ATT_DRYWET, -1.f, 1.f, 0.f, "Dry/Wet CV amount");
-        configParam(PARAM_ATT_GAIN,   -1.f, 1.f, 0.f, "Gain CV amount");
-        configParam(PARAM_ATT_TONE,   -1.f, 1.f, 0.f, "Tone CV amount");
-        configParam(PARAM_ATT_MACRO,  -1.f, 1.f, 0.f, "Macro CV amount");
+        configParam(PARAM_ATT_PITCH, -1.f, 1.f, 0.f, "Pitch CV amount");
+        configParam(PARAM_ATT_MORPH,   -1.f, 1.f, 0.f, "Morph CV amount");
+        configParam(PARAM_ATT_SPREAD,   -1.f, 1.f, 0.f, "Spread CV amount");
+        configParam(PARAM_ATT_TIMBRE,  -1.f, 1.f, 0.f, "Timbre CV amount");
 
         // Jacks labels (optional)
-        configInput(INPUT_CV_DRYWET, "CV Dry/Wet");
-        configInput(INPUT_CV_GAIN,   "CV Gain");
-        configInput(INPUT_CV_TONE,   "CV Tone");
-        configInput(INPUT_CV_MACRO,  "CV Macro");
-        configInput(INPUT_CLOCK,     "Clock");
-        configInput(INPUT_IN_L,      "In L");
-        configInput(INPUT_IN_R,      "In R");
-        configOutput(OUTPUT_ENV,     "Env (0–8 V)");
+        configInput(INPUT_CV_PITCH, "CV Pitch");
+        configInput(INPUT_CV_MORPH,   "CV Morph");
+        configInput(INPUT_CV_SPREAD,   "CV Spread");
+        configInput(INPUT_CV_TIMBRE,  "CV Timbre");
+        configInput(INPUT_SOFT_SYNC,     "Soft Sync");
+        configInput(INPUT_HARD_SYNC,      "Hard Sync");
+        configInput(INPUT_FM_LINEAR,      "FM Linear");
+        configOutput(OUTPUT_AUX,     "AUX");
         configOutput(OUTPUT_OUT_L,   "Out L");
         configOutput(OUTPUT_OUT_R,   "Out R");
     }
@@ -66,8 +66,8 @@ struct VoxTemplateModule : rack::engine::Module {
         core_.setParams(pCur_);
 
         // --- Audio IO ---
-        float inL = inputs[INPUT_IN_L].getVoltage();
-        float inR = inputs[INPUT_IN_R].getVoltage();
+        float inL = inputs[INPUT_HARD_SYNC].getVoltage();
+        float inR = inputs[INPUT_FM_LINEAR].getVoltage();
         float outL = 0.f, outR = 0.f;
         core_.processBlock(&inL, &inR, &outL, &outR, 1);
         outputs[OUTPUT_OUT_L].setVoltage(outL);
@@ -82,7 +82,7 @@ struct VoxTemplateModule : rack::engine::Module {
         pepperEnv_ += a * (amp - pepperEnv_);
 
         float envV = clamp(pepperEnv_ * 8.f, 0.f, 8.f);
-        outputs[OUTPUT_ENV].setVoltage(envV);
+        outputs[OUTPUT_AUX].setVoltage(envV);
         lights[LIGHT_PEPPER].setSmoothBrightness(std::pow(pepperEnv_, 0.6f), args.sampleTime);
     }
 
@@ -108,10 +108,10 @@ private:
         };
 
         ParamsT p{};
-        p.dryWet = clamp(get(PARAM_DRYWET) + get(PARAM_ATT_DRYWET) * sampleCv(INPUT_CV_DRYWET), 0.f, 1.f);
-        p.gain   = clamp(get(PARAM_GAIN)   + get(PARAM_ATT_GAIN)   * sampleCv(INPUT_CV_GAIN),   0.f, 2.f);
-        p.tone   = clamp(get(PARAM_TONE)   + get(PARAM_ATT_TONE)   * sampleCv(INPUT_CV_TONE),   0.f, 1.f);
-        p.macro  = clamp(get(PARAM_MACRO)  + get(PARAM_ATT_MACRO)  * sampleCv(INPUT_CV_MACRO),  0.f, 1.f);
+        p.dryWet = clamp(get(PARAM_PITCH) + get(PARAM_ATT_PITCH) * sampleCv(INPUT_CV_PITCH), 0.f, 1.f);
+        p.gain   = clamp(get(PARAM_MORPH)   + get(PARAM_ATT_MORPH)   * sampleCv(INPUT_CV_MORPH),   0.f, 2.f);
+        p.tone   = clamp(get(PARAM_SPREAD)   + get(PARAM_ATT_SPREAD)   * sampleCv(INPUT_CV_SPREAD),   0.f, 1.f);
+        p.macro  = clamp(get(PARAM_TIMBRE)  + get(PARAM_ATT_TIMBRE)  * sampleCv(INPUT_CV_TIMBRE),  0.f, 1.f);
         return p;
     }
 };

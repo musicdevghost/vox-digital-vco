@@ -1,14 +1,22 @@
 #include "plugin.hpp"
 #include "framework/TemplateWidget.hpp"
 #include "framework/TemplateModule.hpp"
-#include "dsp/VoxAudioCore.hpp"
 
-#define REGISTER_VOX_MODULE(ClassName, CoreType, slug)               using ClassName = VoxTemplateModule<CoreType>;                    Model* model##ClassName = createModel<ClassName, VoxTemplateWidget>(slug)
+// NEW: digital VCO core
+#include "dsp/VoxVcoCore.hpp"
+
+#define REGISTER_VOX_MODULE(ClassName, CoreType, slug) \
+    using ClassName = VoxTemplateModule<CoreType>;      \
+    Model* model##ClassName = createModel<ClassName, VoxTemplateWidget>(slug)
 
 Plugin* pluginInstance = nullptr;
-REGISTER_VOX_MODULE(VoxAudio, VoxAudioCore, "vox-audio");
+
+// NEW module (note vm:: namespace for VoxVcoCore)
+REGISTER_VOX_MODULE(VoxVco, vm::VoxVcoCore, "vox-vco");
 
 void init(Plugin* p) {
     pluginInstance = p;
-    p->addModel(modelVoxAudio);
+
+    // NEW: register the VCO
+    p->addModel(modelVoxVco);
 }

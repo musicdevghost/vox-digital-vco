@@ -24,29 +24,29 @@ struct VoxTemplateWidget : app::ModuleWidget {
         addChild(new PepperOverlay());
 
         // Big knobs (Davies white) and trims (Befaco tiny)
-        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_DRYWET(), module, PARAM_DRYWET));
-        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_GAIN(),   module, PARAM_GAIN));
-        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_TONE(),   module, PARAM_TONE));
-        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_MACRO(),  module, PARAM_MACRO));
+        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_DRYWET(), module, PARAM_PITCH));
+        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_GAIN(),   module, PARAM_MORPH));
+        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_TONE(),   module, PARAM_SPREAD));
+        addParam(createParamCentered<Davies1900hWhiteKnob>(layout::KNOB_MACRO(),  module, PARAM_TIMBRE));
 
-        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_DRYWET(), module, PARAM_ATT_DRYWET));
-        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_GAIN(),   module, PARAM_ATT_GAIN));
-        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_TONE(),   module, PARAM_ATT_TONE));
-        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_MACRO(),  module, PARAM_ATT_MACRO));
+        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_DRYWET(), module, PARAM_ATT_PITCH));
+        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_GAIN(),   module, PARAM_ATT_MORPH));
+        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_TONE(),   module, PARAM_ATT_SPREAD));
+        addParam(createParamCentered<BefacoTinyKnob>(layout::TRIM_MACRO(),  module, PARAM_ATT_TIMBRE));
 
         // CV inputs
-        addInput(createInputCentered<BananutBlackPort>(layout::CV_DRYWET(), module, INPUT_CV_DRYWET));
-        addInput(createInputCentered<BananutBlackPort>(layout::CV_GAIN(),   module, INPUT_CV_GAIN));
-        addInput(createInputCentered<BananutBlackPort>(layout::CV_TONE(),   module, INPUT_CV_TONE));
-        addInput(createInputCentered<BananutBlackPort>(layout::CV_MACRO(),  module, INPUT_CV_MACRO));
+        addInput(createInputCentered<BananutBlackPort>(layout::CV_DRYWET(), module, INPUT_CV_PITCH));
+        addInput(createInputCentered<BananutBlackPort>(layout::CV_GAIN(),   module, INPUT_CV_MORPH));
+        addInput(createInputCentered<BananutBlackPort>(layout::CV_TONE(),   module, INPUT_CV_SPREAD));
+        addInput(createInputCentered<BananutBlackPort>(layout::CV_MACRO(),  module, INPUT_CV_TIMBRE));
 
         // Mid-row jacks: clock (in) + env (out) at exact template locations
-        addInput (createInputCentered<BananutBlackPort>(layout::JACK_CLOCK(), module, INPUT_CLOCK));
-        addOutput(createOutputCentered<BananutRedPort>(layout::JACK_ENV(),    module, OUTPUT_ENV));
+        addInput (createInputCentered<BananutBlackPort>(layout::JACK_CLOCK(), module, INPUT_SOFT_SYNC));
+        addOutput(createOutputCentered<BananutRedPort>(layout::JACK_ENV(),    module, OUTPUT_AUX));
 
         // Audio I/O bottom row (red outs)
-        addInput (createInputCentered<BananutBlackPort>(layout::IN_L(), module, INPUT_IN_L));
-        addInput (createInputCentered<BananutBlackPort>(layout::IN_R(), module, INPUT_IN_R));
+        addInput (createInputCentered<BananutBlackPort>(layout::IN_L(), module, INPUT_HARD_SYNC));
+        addInput (createInputCentered<BananutBlackPort>(layout::IN_R(), module, INPUT_FM_LINEAR));
         addOutput(createOutputCentered<BananutRedPort>(layout::OUT_L(), module, OUTPUT_OUT_L));
         addOutput(createOutputCentered<BananutRedPort>(layout::OUT_R(), module, OUTPUT_OUT_R));
     }
