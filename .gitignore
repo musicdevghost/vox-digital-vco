@@ -1,0 +1,15 @@
+# Build outputs
+build/
+dist/
+plugin.dylib
+
+
+# macOS
+.DS_Store
+
+
+# Daisy build
+hardware/build/
+hardware/*.bin
+hardware/*.elf
+hardware/*.map

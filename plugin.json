@@ -1,0 +1,20 @@
+{
+  "slug": "vm-vox-audio",
+  "version": "2.0.0",
+  "license": "proprietary",
+  "brand": "Voxmachina",
+  "name": "VoxAudio",
+  "author": "Voxmachina",
+  "modules": [
+    {
+      "slug": "vox-audio",
+      "name": "VoxAudio",
+      "description": "Voxmachina audio template module (stereo).",
+      "tags": [
+        "Effect",
+        "Utility",
+        "Template"
+      ]
+    }
+  ]
+}
