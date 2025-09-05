@@ -19,7 +19,7 @@ struct VoxTemplateModule : rack::engine::Module {
         configParam(PARAM_SPREAD,   0.f, 1.f, 0.5f, "Spread");
         configParam(PARAM_TIMBRE,  0.f, 1.f, 0.0f, "Timbre");
 
-        configParam(PARAM_ATT_PITCH, -1.f, 1.f, 0.f, "Pitch CV amount");
+        configParam(PARAM_ATT_PITCH, -1.f, 1.f, 1.f, "Pitch CV amount");
         configParam(PARAM_ATT_MORPH,   -1.f, 1.f, 0.f, "Morph CV amount");
         configParam(PARAM_ATT_SPREAD,   -1.f, 1.f, 0.f, "Spread CV amount");
         configParam(PARAM_ATT_TIMBRE,  -1.f, 1.f, 0.f, "Timbre CV amount");
@@ -63,13 +63,31 @@ struct VoxTemplateModule : rack::engine::Module {
         pCur_.gain   += pDelta_.gain;
         pCur_.tone   += pDelta_.tone;
         pCur_.macro  += pDelta_.macro;
+
+        if (inputs[INPUT_CV_PITCH].isConnected()) {
+            const float att = clamp(params[PARAM_ATT_PITCH].getValue(), -1.f, 1.f);
+            pCur_.pitchVolts = inputs[INPUT_CV_PITCH].getVoltage() * att;  // true 1V/oct
+        } else {
+            pCur_.pitchVolts = 0.0;  // C4 base when no cable
+        }
+
         core_.setParams(pCur_);
 
         // --- Audio IO ---
-        float inL = inputs[INPUT_HARD_SYNC].getVoltage();
+        // Combine hard-sync (bottom-left) and soft-sync (mid jack) onto left input
+        float inL = 0.f;
+        if (inputs[INPUT_HARD_SYNC].isConnected())  inL += inputs[INPUT_HARD_SYNC].getVoltage();
+        if (inputs[INPUT_SOFT_SYNC].isConnected())  inL += inputs[INPUT_SOFT_SYNC].getVoltage();
+
+        // FM (right input)
         float inR = inputs[INPUT_FM_LINEAR].getVoltage();
+
+        // Let the core know if FM is patched (helps it skip inference)
+        pCur_.fmCablePresent = inputs[INPUT_FM_LINEAR].isConnected();
+
         float outL = 0.f, outR = 0.f;
         core_.processBlock(&inL, &inR, &outL, &outR, 1);
+
         outputs[OUTPUT_OUT_L].setVoltage(outL);
         outputs[OUTPUT_OUT_R].setVoltage(outR);
 
@@ -108,10 +126,26 @@ private:
         };
 
         ParamsT p{};
-        p.dryWet = clamp(get(PARAM_PITCH) + get(PARAM_ATT_PITCH) * sampleCv(INPUT_CV_PITCH), 0.f, 1.f);
-        p.gain   = clamp(get(PARAM_MORPH)   + get(PARAM_ATT_MORPH)   * sampleCv(INPUT_CV_MORPH),   0.f, 2.f);
-        p.tone   = clamp(get(PARAM_SPREAD)   + get(PARAM_ATT_SPREAD)   * sampleCv(INPUT_CV_SPREAD),   0.f, 1.f);
-        p.macro  = clamp(get(PARAM_TIMBRE)  + get(PARAM_ATT_TIMBRE)  * sampleCv(INPUT_CV_TIMBRE),  0.f, 1.f);
+
+        // --- TRUE 1 V/oct path ---
+        // pitchVolts is the raw 1 V/oct CV (scaled by attenuverter).
+        // 0 V -> C4 (261.626 Hz); +1 V = +1 octave.
+        if (inputs[INPUT_CV_PITCH].isConnected()) {
+            const float att = clamp(get(PARAM_ATT_PITCH), -1.f, 1.f);
+            p.pitchVolts = inputs[INPUT_CV_PITCH].getVoltage() * att;
+        } else {
+            p.pitchVolts = 0.0; // C4 when no pitch CV
+        }
+
+        // --- Macros ---
+        // Macro A (PITCH knob) is *knob only* and becomes the ±12-semitone offset in the core.
+        p.dryWet = clamp(get(PARAM_PITCH), 0.f, 1.f); // Macro A (no CV added)
+
+        // Macro B/C/D keep their CV paths via attenuverters (unchanged behavior)
+        p.gain   = clamp(get(PARAM_MORPH)  + get(PARAM_ATT_MORPH)  * sampleCv(INPUT_CV_MORPH),  0.f, 2.f);
+        p.tone   = clamp(get(PARAM_SPREAD) + get(PARAM_ATT_SPREAD) * sampleCv(INPUT_CV_SPREAD), 0.f, 1.f);
+        p.macro  = clamp(get(PARAM_TIMBRE) + get(PARAM_ATT_TIMBRE) * sampleCv(INPUT_CV_TIMBRE), 0.f, 1.f);
+
         return p;
     }
 };

@@ -72,10 +72,11 @@ private:
     static constexpr double kMinHz = 0.1;
     static constexpr double kMaxHz = 19000.0;
 #if defined(TARGET_DAISY)
-    static constexpr double kFmMaxHz = 1200.0;
+    static constexpr double kFmMaxHz = 4000.0;  // was 1200 → 4000 for stronger FM
 #else
-    static constexpr double kFmMaxHz = 2000.0;
+    static constexpr double kFmMaxHz = 8000.0;  // was 2000 → 8000
 #endif
+
 
 #if defined(TARGET_DAISY)
     static constexpr double kOutGain = 1.0;   // hardware path wants [-1..+1]

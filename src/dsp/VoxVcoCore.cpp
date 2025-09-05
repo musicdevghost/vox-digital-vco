@@ -66,7 +66,8 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     pwmWidth_ = 0.05 + 0.90 * P_.macroD;
     foldAmt_  = P_.macroD;
     chaosAmt_ = P_.macroD;
-    fmIndex_  = P_.macroD;
+    fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // FM index (0..1) — make the top half much stronger
+
 
     stereoWidth_ = 0.1 + 0.9 * P_.macroC;
     detuneSpreadCents_ = 30.0 * P_.macroC;
@@ -243,9 +244,15 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             // Per-voice instantaneous frequency (through-zero FM in Hz)
             double f = baseHz * ratio;
             if (fmEnabled_) {
-                const double devHz = fmIndex_ * kFmMaxHz;
-                // assume inR in ±5V; scale to ±1 and to Hz deviation
-                f += devHz * fast_clip(fmSample / 5.0, -1.0, 1.0);
+                double norm = fast_clip(fmSample / 5.0, -1.0, 1.0);
+                // Hybrid FM depth: mostly absolute (Hz), plus a bit relative to base
+                // - Absolute part gives wide sidebands on low notes
+                // - Relative part keeps FM audible at higher notes
+                const double absHz = kFmMaxHz * fmIndex_;
+                const double relHz = baseHz * (1.5 * fmIndex_);   // up to ~1.5× base at full
+                const double devHz = absHz * 0.7 + relHz * 0.3;
+
+                f += devHz * norm;
             }
             f = fast_clip(f, -kMaxHz, kMaxHz); // allow negative (through-zero)
 
