@@ -14,11 +14,12 @@ struct VoxTemplateWidget : app::ModuleWidget {
         setModule(module);
         setPanel(trySvg("res/faceplate.svg", "res/ComponentLibrary/Panel.svg"));
 
-        // Screws at 12HP panel corners
-        addChild(createWidget<ScrewSilver>(mm2px(Vec(5.0f, 5.0f))));
-        addChild(createWidget<ScrewSilver>(mm2px(Vec(60.96f - 5.0f, 5.0f))));
-        addChild(createWidget<ScrewSilver>(mm2px(Vec(5.0f, 128.5f - 5.0f))));
-        addChild(createWidget<ScrewSilver>(mm2px(Vec(60.96f - 5.0f, 128.5f - 5.0f))));
+
+        // Screws
+        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
+        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
+        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
 
         // Pepper overlay (auto-skips if svg missing)
         addChild(new PepperOverlay());
