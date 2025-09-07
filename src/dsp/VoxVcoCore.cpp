@@ -27,30 +27,29 @@ void VoxVcoCore::reset() {
 // Params mapping:
 // - pitchVolts: true 1 V/oct (0V=C4)
 // - Macro A: pitch offset (±12 semis) -> P_.macroA in [-1..+1]
-// - Macro B: morph (your UI 0..2) -> normalized to [0..1]
+// - Macro B: morph (UI 0..2) -> normalized to [0..1]
 // - Macro C: unison/spread [0..1]
 // - Macro D: timbre / FM index [0..1] (sqrt curve for hotter top)
 void VoxVcoCore::setParams(const IDspCore::Params& p) {
     // ---- Pitch (V/Oct) ----
-    P_.pitchVolts = p.pitchVolts; // OK if 0.0 when wrapper doesn't provide it
+    P_.pitchVolts = p.pitchVolts;
 
     // Prefer explicit macros[0..3]; if they look defaulted, fall back to dryWet/gain/tone/macro
     double m[4] = { p.macros[0], p.macros[1], p.macros[2], p.macros[3] };
     const bool macrosProvided = (m[0] != 0.0 || m[1] != 0.0 || m[2] != 0.0 || m[3] != 0.0);
-
     if (!macrosProvided) {
         m[0] = p.dryWet; // Macro A
-        m[1] = p.gain;   // Macro B (note: your UI uses 0..2)
+        m[1] = p.gain;   // Macro B (note: UI uses 0..2)
         m[2] = p.tone;   // Macro C
         m[3] = p.macro;  // Macro D
     }
 
     // Map & clamp
-    const double mA = fast_clip(m[0], 0.0, 1.0);
-    const double mB_raw = fast_clip(m[1], 0.0, 2.0); // accept UI's 0..2
-    const double mB_norm = mB_raw * 0.5;             // normalize to 0..1 for the core
-    const double mC = fast_clip(m[2], 0.0, 1.0);
-    const double mD = fast_clip(m[3], 0.0, 1.0);
+    const double mA      = fast_clip(m[0], 0.0, 1.0);
+    const double mB_raw  = fast_clip(m[1], 0.0, 2.0); // accept UI's 0..2
+    const double mB_norm = mB_raw * 0.5;              // normalize to 0..1 for the core
+    const double mC      = fast_clip(m[2], 0.0, 1.0);
+    const double mD      = fast_clip(m[3], 0.0, 1.0);
 
     P_.macroA = mA * 2.0 - 1.0;  // [-1..+1] → ±12 semis inside process
     P_.macroB = mB_norm;         // morph 0..1
@@ -70,15 +69,16 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     chaosAmt_ = P_.macroD;
     fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // hotter top
 
-    stereoWidth_ = 0.1 + 0.9 * P_.macroC;
+    // IMPORTANT: width = macroC (no baseline offset) so width can be 0
+    stereoWidth_       = P_.macroC;        // 0..1
     detuneSpreadCents_ = 30.0 * P_.macroC;
 }
 
 void VoxVcoCore::updateUnisonFromMacro(double mc) {
-    if (mc < 0.125) unisonCount_ = 1;
+    if (mc < 0.125)      unisonCount_ = 1;
     else if (mc < 0.375) unisonCount_ = 3;
     else if (mc < 0.625) unisonCount_ = 5;
-    else unisonCount_ = 7;
+    else                 unisonCount_ = 7;
 }
 
 void VoxVcoCore::advanceDrift(Voice& v, double depthCents) {
@@ -90,26 +90,28 @@ void VoxVcoCore::advanceDrift(Voice& v, double depthCents) {
     v.drift = a * v.drift + (1.0 - a) * target;
 }
 
-inline double morphMix(double a, double b, double x) {
-    // equal-power-ish curve for nicer morph
-    const double t = fast_clip(x, 0.0, 1.0);
+// Peak-normalized equal-power crossfade: smooth AND keeps peak near 1.0
+static inline double morphMix(double a, double b, double x) {
+    const double t  = fast_clip(x, 0.0, 1.0);
     const double wa = std::cos(0.5 * M_PI * t);
     const double wb = std::sin(0.5 * M_PI * t);
-    return a * wa + b * wb;
+    double y = a * wa + b * wb;
+    const double norm = wa + wb;            // upper bound on the peak if a,b align
+    return (norm > 1e-9) ? (y / norm) : y;  // keeps peak ~1 across the crossfade
 }
 
 double VoxVcoCore::renderCore(double phase, double dt, double morph01,
                               double timbre01, double& triState,
                               double& outSquareForTri) const
 {
-    // Map morph01 [0..1] to zones 0..4, clamp to last zone
-    const double morph4 = morph01 * 4.0;
-    int zone = (int)std::floor(morph4);
-    if (zone > 3) zone = 3;          // avoid zone==4 wrap
-    const double zf = morph4 - std::floor(morph4); // in-zone morph [0..1)
+    // Robust mapping of morph to 4 zones with continuous edge at 1.0
+    const double m = fast_clip(morph01, 0.0, 1.0);
+    double whole = 0.0;
+    double zf = std::modf(m * 4.0, &whole);   // [0,1)
+    int zone = (int)whole;
+    if (zone >= 4) { zone = 3; zf = 1.0; }
 
-    // Basic phasor
-    double t = phase; // [0,1)
+    double t = phase;                  // [0,1)
     const double dtAbs = std::fabs(dt);
 
     // ---------- Primitives ----------
@@ -117,7 +119,7 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     double saw = 2.0 * t - 1.0;
     saw -= poly_blep(t, dtAbs);
 
-    // PWM Square (polyBLEP at both edges); TIMBRE = duty in this region
+    // PWM square (BLEP both edges); TIMBRE is duty here
     const double w = fast_clip(timbre01 * 0.90 + 0.05, 0.05, 0.95);
     double sq = (t < w ? 1.0 : -1.0);
     sq += poly_blep(t, dtAbs);
@@ -125,55 +127,67 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     sq -= poly_blep(tw, dtAbs);
     outSquareForTri = sq;
 
-    // 50% duty BL square for triangle integration (amplitude-stable)
+    // 50% BLEP square for triangle integration
     double sq50 = (t < 0.5 ? 1.0 : -1.0);
     sq50 += poly_blep(t, dtAbs);
     double t2 = t - 0.5; if (t2 < 0.0) t2 += 1.0;
     sq50 -= poly_blep(t2, dtAbs);
 
-    // Triangle by exact integration; works with signed dt (TZFM)
-    triState += (2.0 * dt) * sq50;
+    // Triangle (correct slope 4*dt); peaks at t ≈ 0.5
+    triState += (4.0 * dt) * sq50;
     if (triState > 1.2) triState = 1.2; else if (triState < -1.2) triState = -1.2;
-    const double tri = triState;
+    const double tri = triState;       // ~±1 peak
 
-    // Sine and a phase-distorted sine driven by TIMBRE
-    const double theta = 2.0 * M_PI * t;
-    const double sine  = std::sin(theta);
-    double ph = t + 0.25 * timbre01 * std::sin(theta); // warp phase; 0..1 wrap
+    // --- Sine family (phase-align to triangle max at t=0.5) ---
+    double tSin = t - 0.25; if (tSin < 0.0) tSin += 1.0;
+    const double theta = 2.0 * M_PI * tSin;
+    const double sine  = std::sin(theta);     // ±1 peak
+
+    // Phase-distorted sine (use aligned phase too) — still ±1 peak
+    double ph = tSin + 0.25 * timbre01 * std::sin(theta);
     ph -= std::floor(ph);
     const double sinePD = std::sin(2.0 * M_PI * ph);
 
-    // Triangle curvature (TIMBRE increases odd-harm content gently)
-    const double triShaped = tri * (1.0 - timbre01) + std::tanh(tri * (1.0 + 3.0 * timbre01)) * timbre01;
+    // --- Zone-specific timbre shapes (now amplitude-normalized) ---
 
-    // Folded/chaotic core (depth from TIMBRE)
-#if 1
-    const double folded = std::tanh( (1.0 + 4.0 * timbre01) * sine );
-#else
-    const double folded = softclip3((1.0 + 4.0 * timbre01) * sine);
-#endif
+    // Triangle curvature: tanh(g*tri)/tanh(g) keeps peak = 1 for any g
+    const double gTri = 1.0 + 3.0 * timbre01;
+    const double invTanh_gTri = 1.0 / std::tanh(gTri);
+    const double triNL = std::tanh(gTri * tri) * invTanh_gTri;
+    const double triShaped = tri * (1.0 - timbre01) + triNL * timbre01;
 
-    // ---------- Morph zones ----------
+    // Folded/chaotic from sine: tanh(f*sine)/tanh(f) keeps peak = 1
+    const double gFold = 1.0 + 4.0 * timbre01;
+    const double invTanh_gFold = 1.0 / std::tanh(gFold);
+    const double folded = std::tanh(gFold * sine) * invTanh_gFold;
+
+    // ---------- Smooth crossfades ----------
+    auto mixPeakNorm = [](double a, double b, double x) {
+        const double u  = fast_clip(x, 0.0, 1.0);
+        const double wa = std::cos(0.5 * M_PI * u);
+        const double wb = std::sin(0.5 * M_PI * u);
+        double y = a * wa + b * wb;
+        const double norm = wa + wb;
+        return (norm > 1e-9) ? (y / norm) : y; // keeps peaks <= 1 and flatter
+    };
+
     double y = 0.0;
     switch (zone) {
         default:
-        case 0: // Sine -> Triangle  (timbre = PD on sine)
-            y = morphMix(sinePD, tri, zf);
-            break;
-
-        case 1: // Triangle -> Saw   (timbre = curvature on triangle)
-            y = morphMix(triShaped, saw, zf);
-            break;
-
-        case 2: // Saw -> PWM Square (timbre = PWM duty already applied)
-            y = morphMix(saw, sq, zf);
-            break;
-
-        case 3: // PWM Square -> Folded/Chaotic (timbre = fold depth)
-            y = morphMix(sq, folded, zf);
-            break;
+        case 0: y = mixPeakNorm(sinePD,    tri,    zf); break; // (aligned)
+        case 1: y = mixPeakNorm(triShaped, saw,    zf); break; // (tri NL normalized)
+        case 2: y = mixPeakNorm(saw,       sq,     zf); break; // (both ±1)
+        case 3: y = mixPeakNorm(sq,        folded, zf); break; // (fold normalized)
     }
-    return y;
+
+    // Optional: very light center lift per zone to shave residual wobble (<0.5 dB)
+    auto midComp = [](double z, double k){ return 1.0 + k * z * (1.0 - z); };
+    if (zone == 0) y *= midComp(zf, 0.03);  // Sine↔Tri
+    if (zone == 1) y *= midComp(zf, 0.02);  // Tri ↔ Saw
+    if (zone == 2) y *= midComp(zf, 0.015); // Saw ↔ PWM
+    // Zone 3 rarely needs it; add 0.01 if you want it perfectly flat.
+
+    return y; // ~±1 peak across the morph
 }
 
 void VoxVcoCore::processBlock(const float* inL, const float* inR,
@@ -199,17 +213,36 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
     // Precompute per-voice pan positions and detunes
     double panPos[kMaxUnison] = {0};
-    double detC[kMaxUnison] = {0};
+    double gL[kMaxUnison] = {0};
+    double gR[kMaxUnison] = {0};
+    double sumGL = 0.0, sumGR = 0.0;
 
     if (unisonCount_ == 1) {
         panPos[0] = 0.5;
-        detC[0] = 0.0;
     } else {
         for (int i = 0; i < unisonCount_; ++i) {
             const double idx01 = (unisonCount_ <= 1) ? 0.5 : double(i) / double(unisonCount_ - 1);
-            const double centered = (idx01 - 0.5);
-            panPos[i] = 0.5 + centered * stereoWidth_;
-            // Triangular symmetric detune profile
+            panPos[i] = 0.5 + (idx01 - 0.5) * stereoWidth_; // spread around center
+            if (panPos[i] < 0.0) panPos[i] = 0.0;
+            if (panPos[i] > 1.0) panPos[i] = 1.0;
+        }
+    }
+    for (int i = 0; i < unisonCount_; ++i) {
+        gL[i] = equalPowerL(panPos[i]);
+        gR[i] = equalPowerR(panPos[i]);
+        sumGL += gL[i];
+        sumGR += gR[i];
+    }
+
+    // Soft floors so we don't explode a channel when everything is hard-panned away
+    const double normFloor = 0.25; // ~-12 dB floor
+    const double invSumGL = (sumGL > normFloor) ? (1.0 / sumGL) : 1.0;
+    const double invSumGR = (sumGR > normFloor) ? (1.0 / sumGR) : 1.0;
+
+    // Build per-voice detune (symmetric) once per block
+    double detC[kMaxUnison] = {0};
+    if (unisonCount_ > 1) {
+        for (int i = 0; i < unisonCount_; ++i) {
             const double sgn = (i % 2 == 0) ? -1.0 : +1.0;
             const double mag = (double(i) / double(unisonCount_ - 1));
             detC[i] = sgn * mag * detuneSpreadCents_;
@@ -281,27 +314,24 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                         P_.macroB, P_.macroD,
                                         V.triI, sqForTri);
 
-            // Pan and mix
-            const double pan = fast_clip(panPos[v], 0.0, 1.0);
-            const double gL = equalPowerL(pan);
-            const double gR = equalPowerR(pan);
-
-            L += y * gL;
-            R += y * gR;
+            // Pan and mix (no /N here; we normalize per-channel by sum of gains)
+            L += y * gL[v];
+            R += y * gR[v];
 
             // Advance phase (through-zero OK)
             V.phase += dt;
             V.phase -= std::floor(V.phase); // wrap to [0,1)
         }
 
-        // Normalize by voice count and scale to target volts
-        const double invN = 1.0 / double(unisonCount_);
-        double yL = L * invN;
-        double yR = R * invN;
-        // simple safety clamp so FM/fold don’t explode; keep linear up to ±1
+        // Normalize by channel pan gains so each output sits ~±1 peak,
+        // then scale to volts and clamp gently.
+        double yL = L * invSumGL;
+        double yR = R * invSumGR;
+
         yL = fast_clip(yL, -1.0, 1.0);
         yR = fast_clip(yR, -1.0, 1.0);
-        outL[i] = float(yL * kOutGain);
+
+        outL[i] = float(yL * kOutGain); // ~±5 V per channel
         outR[i] = float(yR * kOutGain);
     }
 

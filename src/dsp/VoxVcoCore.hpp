@@ -14,7 +14,6 @@ static inline double fast_clip(double x, double lo, double hi) {
 
 // PolyBLEP (normalized phase t in [0,1), dt = phase increment per sample)
 static inline double poly_blep(double t, double dt) {
-    // Guard for extreme small dt
     if (dt <= 0.0) return 0.0;
     if (t < dt) {
         const double x = t / dt;
@@ -36,7 +35,6 @@ struct OnePoleHP {
         z = 0.0;
     }
     inline double process(double x) {
-        // y = x - z; z = x * a + y * a;
         const double y = x - z;
         z = x * a + y * a;
         return y;
@@ -71,17 +69,17 @@ private:
     static constexpr double kC4 = 261.6255653006; // Hz
     static constexpr double kMinHz = 0.1;
     static constexpr double kMaxHz = 19000.0;
-#if defined(TARGET_DAISY)
-    static constexpr double kFmMaxHz = 4000.0;  // was 1200 → 4000 for stronger FM
-#else
-    static constexpr double kFmMaxHz = 8000.0;  // was 2000 → 8000
-#endif
 
+#if defined(TARGET_DAISY)
+    static constexpr double kFmMaxHz = 4000.0;  // stronger FM on Seed
+#else
+    static constexpr double kFmMaxHz = 8000.0;  // Rack
+#endif
 
 #if defined(TARGET_DAISY)
     static constexpr double kOutGain = 1.0;   // hardware path wants [-1..+1]
 #else
-    static constexpr double kOutGain = 5.0;   // Rack wants ±5 V
+    static constexpr double kOutGain = 5.0;   // Rack wants ±5 V (≈10 Vpp)
 #endif
 
     // ---- State ----
@@ -113,7 +111,7 @@ private:
         double macroB = 0.0;     // Morph [0..1] mapped to [0..4] path
         double macroC = 0.0;     // Unison/Spread [0..1]
         double macroD = 0.0;     // Timbre or FM index [0..1]
-        bool   fmCable = false;  // IN R present (wrapper sets true if connected) - if not available, infer from inR energy
+        bool   fmCable = false;  // IN R present (wrapper sets true)
     } P_;
 
     // derived per-block settings

@@ -142,7 +142,11 @@ private:
         p.dryWet = clamp(get(PARAM_PITCH), 0.f, 1.f); // Macro A (no CV added)
 
         // Macro B/C/D keep their CV paths via attenuverters (unchanged behavior)
-        p.gain   = clamp(get(PARAM_MORPH)  + get(PARAM_ATT_MORPH)  * sampleCv(INPUT_CV_MORPH),  0.f, 2.f);
+        // Before:
+        // p.gain   = clamp(get(PARAM_MORPH) + get(PARAM_ATT_MORPH) * sampleCv(INPUT_CV_MORPH),   0.f, 2.f);
+
+        // After: scale CV by 2× so ±5 V => ±1.0 -> full 0..2 sweep
+        p.gain   = clamp(get(PARAM_MORPH) + 2.f * get(PARAM_ATT_MORPH) * sampleCv(INPUT_CV_MORPH), 0.f, 2.f);
         p.tone   = clamp(get(PARAM_SPREAD) + get(PARAM_ATT_SPREAD) * sampleCv(INPUT_CV_SPREAD), 0.f, 1.f);
         p.macro  = clamp(get(PARAM_TIMBRE) + get(PARAM_ATT_TIMBRE) * sampleCv(INPUT_CV_TIMBRE), 0.f, 1.f);
 
