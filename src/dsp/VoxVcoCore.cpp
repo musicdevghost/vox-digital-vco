@@ -13,6 +13,11 @@ void VoxVcoCore::init(double sampleRate) {
     for (int i = 0; i < kMaxUnison; ++i) {
         voices_[i].rng.seed(0xC0FFEEu + 17u * (i + 1));
     }
+#if defined(TARGET_DAISY)
+    limiter_.setup(sr_, /*look_ms=*/0.75, /*atk_ms=*/0.10, /*rel_ms=*/80.0, /*targetVolts=*/1.0);
+#else
+    limiter_.setup(sr_, /*look_ms=*/0.75, /*atk_ms=*/0.10, /*rel_ms=*/80.0, /*targetVolts=*/5.0);
+#endif
     reset();
 }
 
@@ -346,12 +351,16 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             V.phase -= std::floor(V.phase);
         }
 
-        // Normalize by channel pan gains and scale to volts
-        double yL = fast_clip(L * invSumGL, -1.0, 1.0);
-        double yR = fast_clip(R * invSumGR, -1.0, 1.0);
+        // Normalize by channel pan gains (unit domain, no hard clip here)
+        double yL = L * invSumGL;
+        double yR = R * invSumGR;
 
-        outL[i] = float(yL * kOutGain); // ~±5 V per channel
-        outR[i] = float(yR * kOutGain);
+        // Scale to volts *before* limiter so it measures in real volts
+        double preLimL = yL * kOutGain;
+        double preLimR = yR * kOutGain;
+
+        // Stereo-linked lookahead limiter to ceiling at ±target
+        limiter_.process(preLimL, preLimR, outL[i], outR[i]);
     }
 
     // store prevSync across blocks

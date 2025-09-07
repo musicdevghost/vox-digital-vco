@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdint>
 #include <array>
+#include <algorithm>
 #include "IDspCore.hpp"   // your template interface
 
 namespace vm {
@@ -77,9 +78,9 @@ private:
 #endif
 
 #if defined(TARGET_DAISY)
-    static constexpr double kOutGain = 1.0;
+    static constexpr double kOutGain = 1.0;  // hardware path [-1..+1]
 #else
-    static constexpr double kOutGain = 5.0;
+    static constexpr double kOutGain = 5.0;  // Rack path ±5 V
 #endif
 
     // ---- State ----
@@ -118,6 +119,73 @@ private:
     double chaosAmt_ = 0.0;
     double fmIndex_ = 0.0;
     bool   fmEnabled_ = false;
+
+    // ---- Stereo lookahead limiter (linked) ----
+    struct LookaheadLimiter {
+        static constexpr int kMax = 256;  // max ring size
+        // ring buffers
+        double bufL[kMax]{}, bufR[kMax]{}, absBuf[kMax]{};
+        int w = 0;     // write index
+        int r = 0;     // read index (delayed sample)
+        int size = 64; // lookahead in samples (<= kMax-1)
+
+        double target = 5.0; // ceiling in volts (Rack=5.0, Daisy=1.0)
+        double gr = 1.0;     // current gain reduction (<= 1)
+        double atkA = 0.0;   // attack smoothing coeff
+        double relA = 0.0;   // release smoothing coeff
+
+        void setup(double sr, double look_ms = 0.75, double atk_ms = 0.10, double rel_ms = 80.0, double targetVolts = 5.0) {
+            target = targetVolts;
+            // clamp sizes
+            int req = (int)std::lround(sr * (look_ms * 0.001));
+            size = std::min(kMax - 1, std::max(8, req));
+            w = 0;
+            // place read pointer 'size' samples behind (so we can look ahead by 'size')
+            r = (kMax - size) % kMax;
+            gr = 1.0;
+            // 1-pole coefficients
+            atkA = std::exp(-1.0 / (sr * (atk_ms * 0.001))); // fast toward lower gr
+            relA = std::exp(-1.0 / (sr * (rel_ms * 0.001))); // slow toward higher gr
+            for (int i = 0; i < kMax; ++i) { bufL[i] = bufR[i] = absBuf[i] = 0.0; }
+        }
+
+        inline void process(double inL, double inR, float& outL, float& outR) {
+            // write newest sample
+            bufL[w] = inL;
+            bufR[w] = inR;
+            absBuf[w] = std::max(std::abs(inL), std::abs(inR));
+
+            // look ahead: find peak over next 'size' samples (O(size), small)
+            double peak = 1e-12;
+            int idx = w;
+            for (int i = 0; i < size; ++i) {
+                double a = absBuf[idx];
+                if (a > peak) peak = a;
+                if (--idx < 0) idx = kMax - 1;
+            }
+
+            // desired gain reduction to hit 'target'
+            double desired = (peak > 1e-12) ? std::min(1.0, target / peak) : 1.0;
+
+            // smooth: fast when reducing (attack), slow when releasing
+            if (desired < gr)
+                gr = desired + (gr - desired) * atkA;
+            else
+                gr = desired + (gr - desired) * relA;
+
+            // read delayed sample and apply current GR
+            double yL = bufL[r] * gr;
+            double yR = bufR[r] * gr;
+            outL = (float)yL;
+            outR = (float)yR;
+
+            // advance indices
+            if (++w >= kMax) w = 0;
+            if (++r >= kMax) r = 0;
+        }
+    };
+
+    LookaheadLimiter limiter_;
 
     // helpers
     inline void updateUnisonFromMacro(double mc);
