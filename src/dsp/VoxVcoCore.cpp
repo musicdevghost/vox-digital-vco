@@ -63,7 +63,7 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     P_.macroC = mC;              // unison/spread 0..1
     P_.macroD = mD;              // timbre / FM index 0..1
 
-    // Unison / spread
+    // Legacy unison count (not used for mixing anymore, kept for compatibility)
     updateUnisonFromMacro(P_.macroC);
 
     // FM cable (wrapper may set; otherwise we infer in processBlock())
@@ -76,7 +76,7 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     chaosAmt_ = P_.macroD;
     fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // hotter top
 
-    // IMPORTANT: width and detune scale still follow Macro C (previous behavior)
+    // Width and detune span track macro C (continuous)
     stereoWidth_       = P_.macroC;        // 0..1
     detuneSpreadCents_ = 30.0 * P_.macroC;
 }
@@ -86,6 +86,34 @@ void VoxVcoCore::updateUnisonFromMacro(double mc) {
     else if (mc < 0.375) unisonCount_ = 3;
     else if (mc < 0.625) unisonCount_ = 5;
     else                 unisonCount_ = 7;
+}
+
+// Compute per-voice activations (center always 1; 3 pairs fade in at thresholds)
+void VoxVcoCore::computeVoiceActivations_(double a, double act[7]) const {
+    // Historical thresholds for 1/3/5/7 voices
+    const double t1 = 0.125; // add inner pair
+    const double t2 = 0.375; // add middle pair
+    const double t3 = 0.625; // add outer pair
+    const double bw = kPairXfadeBW;
+
+    // Pair weights via smoothstep over [t-bw, t+bw]
+    auto ramp = [&](double x, double t) {
+        const double lo = t - bw, hi = t + bw;
+        return sstep((x - lo) / std::max(1e-9, (hi - lo)));
+    };
+
+    const double w1 = ramp(a, t1); // inner pair (±1/3)
+    const double w2 = ramp(a, t2); // middle pair (±2/3)
+    const double w3 = ramp(a, t3); // outer pair (±1)
+
+    // Map to 7 slots (0..6): [-1, -2/3, -1/3, 0, +1/3, +2/3, +1]
+    act[0] = w3; // -1
+    act[1] = w2; // -2/3
+    act[2] = w1; // -1/3
+    act[3] = 1.0; // center
+    act[4] = w1; // +1/3
+    act[5] = w2; // +2/3
+    act[6] = w3; // +1
 }
 
 void VoxVcoCore::advanceDrift(Voice& v, double depthCents) {
@@ -107,15 +135,12 @@ static inline double morphMix(double a, double b, double x) {
     return (norm > 1e-9) ? (y / norm) : y;
 }
 
-// NEW: cheap reflect-based wavefolder (branch-light, no loops).
-// Folds an input of arbitrary amplitude back into [-1, 1].
+// Cheap reflect-based wavefolder
 static inline double fold_reflect(double x) {
-    // Map to [0,2)
     double u = x + 1.0;
     u -= 2.0 * std::floor(u * 0.5);
-    // Reflect second half
     if (u > 1.0) u = 2.0 - u;
-    return u - 1.0; // back to [-1,1]
+    return u - 1.0;
 }
 
 double VoxVcoCore::renderCore(double phase, double dt, double morph01,
@@ -166,36 +191,24 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     ph -= std::floor(ph);
     const double sinePD = std::sin(2.0 * M_PI * ph);
 
-    // ------ NEW aggressive sine fold when MORPH near ends ------
-    // Edge emphasis grows near morph extremes (0 or 1), 0 at center (0.5).
+    // Aggressive folding near morph ends
     const double edge = std::pow(std::min(1.0, std::abs(m - 0.5) * 2.0), 0.8);
-    // Drive rises with TIMBRE^2, boosted near edges; clamped for stability.
     double drive = 1.0 + (2.0 + 6.0 * edge) * (timbre01 * timbre01);
     if (drive > 9.0) drive = 9.0;
-
-    // Harder fold of sine; bounded in [-1,1].
     const double sineFoldHard = fold_reflect(sine * drive);
-
-    // Blend PD-sine → hard-fold with TIMBRE (keeps low-TIMBRE gentle, high-TIMBRE aggressive).
     const double sineAgg = morphMix(sinePD, sineFoldHard, timbre01);
 
     // --- Zone-specific timbre shapes (kept normalized) ---
-
-    // Triangle curvature: tanh(g*tri)/tanh(g) keeps peak = 1 for any g
     const double gTri = 1.0 + 3.0 * timbre01;
     const double invTanh_gTri = 1.0 / std::tanh(gTri);
     const double triNL = std::tanh(gTri * tri) * invTanh_gTri;
     const double triShaped = tri * (1.0 - timbre01) + triNL * timbre01;
 
-    // Soft "fold" from sine via tanh (original), kept as the soft baseline
     const double gFold = 1.0 + 4.0 * timbre01;
     const double invTanh_gFold = 1.0 / std::tanh(gFold);
     const double foldedSoft = std::tanh(gFold * sine) * invTanh_gFold;
+    const double foldedAgg  = morphMix(foldedSoft, sineFoldHard, timbre01);
 
-    // NEW: soft→hard fold crossfade for Zone 3's "folded" endpoint
-    const double foldedAgg = morphMix(foldedSoft, sineFoldHard, timbre01);
-
-    // ---------- Smooth crossfades ----------
     auto mixPeakNorm = [](double a, double b, double x) {
         const double u  = fast_clip(x, 0.0, 1.0);
         const double wa = std::cos(0.5 * M_PI * u);
@@ -208,10 +221,10 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     double y = 0.0;
     switch (zone) {
         default:
-        case 0: y = mixPeakNorm(sineAgg,    tri,    zf); break; // sine side is now PD→hard-fold by TIMBRE
+        case 0: y = mixPeakNorm(sineAgg,    tri,    zf); break;
         case 1: y = mixPeakNorm(triShaped,  saw,    zf); break;
         case 2: y = mixPeakNorm(saw,        sq,     zf); break;
-        case 3: y = mixPeakNorm(sq,         foldedAgg, zf); break; // folded side becomes soft→hard by TIMBRE
+        case 3: y = mixPeakNorm(sq,         foldedAgg, zf); break;
     }
 
     // Light mid-comp remains to keep peaks flat across the path
@@ -244,41 +257,38 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     const double semis = P_.macroA * 12.0; // ±12
     const double baseHz = fast_clip(kC4 * std::pow(2.0, P_.pitchVolts + semis / 12.0), kMinHz, kMaxHz);
 
-    // Precompute per-voice pan positions and detunes
-    double panPos[kMaxUnison] = {0};
-    double gL[kMaxUnison] = {0};
-    double gR[kMaxUnison] = {0};
+    // ----- Activation weights for 7 fixed slots -----
+    double act[kMaxUnison];
+    computeVoiceActivations_(P_.macroC, act);
+
+    // ----- Precompute per-voice pan gains (equal power), using fixed positions -----
+    double gL[kMaxUnison] = {0.0}, gR[kMaxUnison] = {0.0};
     double sumGL = 0.0, sumGR = 0.0;
 
-    if (unisonCount_ == 1) {
-        panPos[0] = 0.5;
-    } else {
-        for (int i = 0; i < unisonCount_; ++i) {
-            const double idx01 = (unisonCount_ <= 1) ? 0.5 : double(i) / double(unisonCount_ - 1);
-            panPos[i] = 0.5 + (idx01 - 0.5) * stereoWidth_; // spread around center
-            if (panPos[i] < 0.0) panPos[i] = 0.0;
-            if (panPos[i] > 1.0) panPos[i] = 1.0;
-        }
-    }
-    for (int i = 0; i < unisonCount_; ++i) {
-        gL[i] = equalPowerL(panPos[i]);
-        gR[i] = equalPowerR(panPos[i]);
-        sumGL += gL[i];
-        sumGR += gR[i];
+    for (int v = 0; v < kMaxUnison; ++v) {
+        // base slot position in [-1,1]: (-3..+3)/3
+        const double basePos = (double(v) - 3.0) / 3.0;
+        const double pan     = basePos * stereoWidth_;         // apply width
+        const double pan01   = 0.5 * (pan + 1.0);              // -> [0,1]
+        gL[v] = equalPowerL(pan01);
+        gR[v] = equalPowerR(pan01);
+        // include activation in normalization sums
+        sumGL += gL[v] * act[v];
+        sumGR += gR[v] * act[v];
     }
 
-    const double normFloor = 0.25; // ~-12 dB floor
-    const double invSumGL = (sumGL > normFloor) ? (1.0 / sumGL) : 1.0;
-    const double invSumGR = (sumGR > normFloor) ? (1.0 / sumGR) : 1.0;
+    // Avoid division blow-ups; center is always active so sums are healthy
+    const double normFloor = 0.25;
+    const double invSumGL  = (sumGL > normFloor) ? (1.0 / sumGL) : 1.0;
+    const double invSumGR  = (sumGR > normFloor) ? (1.0 / sumGR) : 1.0;
 
-    // Build per-voice detune (symmetric) once per block
-    double detC[kMaxUnison] = {0};
-    if (unisonCount_ > 1) {
-        for (int i = 0; i < unisonCount_; ++i) {
-            const double sgn = (i % 2 == 0) ? -1.0 : +1.0;
-            const double mag = (double(i) / double(unisonCount_ - 1));
-            detC[i] = sgn * mag * detuneSpreadCents_;
-        }
+    // ----- Fixed symmetric detune per slot (sign from side, mag from |pos|) -----
+    double detC[kMaxUnison] = {0.0};
+    for (int v = 0; v < kMaxUnison; ++v) {
+        const double basePos = (double(v) - 3.0) / 3.0;   // -1,-2/3,-1/3,0,+1/3,+2/3,+1
+        const double sgn = (basePos < 0.0) ? -1.0 : (basePos > 0.0 ? 1.0 : 0.0);
+        const double mag = std::abs(basePos);             // 0..1
+        detC[v] = sgn * mag * detuneSpreadCents_;
     }
 
     // Process
@@ -303,11 +313,11 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
         double L = 0.0, R = 0.0;
 
-        // Each voice
-        for (int v = 0; v < unisonCount_; ++v) {
+        // Each of 7 slots (some may be softly inactive via act[v] ~ 0)
+        for (int v = 0; v < kMaxUnison; ++v) {
             auto& V = voices_[v];
 
-            // Advance drift (3..7 cents depth scaled with macroC)
+            // Slow drift depth still scales with spread (continuous)
             advanceDrift(V, 3.0 + 4.0 * P_.macroC);
             const double cents = detC[v] + V.drift;
             const double ratio = detuneCentsToRatio(cents);
@@ -322,7 +332,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                 f += devHz * norm;
             }
             f = fast_clip(f, -kMaxHz, kMaxHz); // allow negative (through-zero)
-
             const double dt = f * invSr_;
 
             // Hard/soft sync handling
@@ -342,22 +351,23 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                         P_.macroB, P_.macroD,
                                         V.triI, sqForTri);
 
-            // Pan and mix
-            L += y * gL[v];
-            R += y * gR[v];
+            // Pan and mix with activation
+            const double a = act[v];
+            L += y * gL[v] * a;
+            R += y * gR[v] * a;
 
             // Advance phase (through-zero OK)
             V.phase += dt;
             V.phase -= std::floor(V.phase);
         }
 
-        // Normalize by channel pan gains (unit domain, no hard clip here)
-        double yL = L * invSumGL;
-        double yR = R * invSumGR;
+        // Normalize by *activation-weighted* pan sums (keeps loudness stable)
+        const double yL = L * invSumGL;
+        const double yR = R * invSumGR;
 
         // Scale to volts *before* limiter so it measures in real volts
-        double preLimL = yL * kOutGain;
-        double preLimR = yR * kOutGain;
+        const double preLimL = yL * kOutGain;
+        const double preLimR = yR * kOutGain;
 
         // Stereo-linked lookahead limiter to ceiling at ±target
         limiter_.process(preLimL, preLimR, outL[i], outR[i]);

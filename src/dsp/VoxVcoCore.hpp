@@ -66,10 +66,13 @@ public:
 
 private:
     // ---- Constants ----
-    static constexpr int kMaxUnison = 7;
-    static constexpr double kC4 = 261.6255653006; // Hz
-    static constexpr double kMinHz = 0.1;
-    static constexpr double kMaxHz = 19000.0;
+    static constexpr int    kMaxUnison = 7;     // fixed internal layout: 7 slots
+    static constexpr double kC4        = 261.6255653006; // Hz
+    static constexpr double kMinHz     = 0.1;
+    static constexpr double kMaxHz     = 19000.0;
+
+    // Spread smoothing: crossfade bandwidth around the historical thresholds
+    static constexpr double kPairXfadeBW = 0.08;   // ±band around each threshold
 
 #if defined(TARGET_DAISY)
     static constexpr double kFmMaxHz = 4000.0;
@@ -105,15 +108,15 @@ private:
         double pitchVolts = 0.0;
         double macroA = 0.0;
         double macroB = 0.0;
-        double macroC = 0.0;
+        double macroC = 0.0; // SPREAD [0..1]
         double macroD = 0.0;
         bool   fmCable = false;
     } P_;
 
     // derived per-block settings
-    int    unisonCount_ = 1;
-    double detuneSpreadCents_ = 0.0;
-    double stereoWidth_ = 0.0;
+    int    unisonCount_ = 1;         // legacy (kept for compatibility), not used for mixing
+    double detuneSpreadCents_ = 0.0; // scales with macroC (unchanged)
+    double stereoWidth_ = 0.0;       // 0..1
     double pwmWidth_ = 0.5;
     double foldAmt_ = 0.0;
     double chaosAmt_ = 0.0;
@@ -123,39 +126,26 @@ private:
     // ---- Stereo lookahead limiter (linked) ----
     struct LookaheadLimiter {
         static constexpr int kMax = 256;  // max ring size
-        // ring buffers
         double bufL[kMax]{}, bufR[kMax]{}, absBuf[kMax]{};
-        int w = 0;     // write index
-        int r = 0;     // read index (delayed sample)
-        int size = 64; // lookahead in samples (<= kMax-1)
-
-        double target = 5.0; // ceiling in volts (Rack=5.0, Daisy=1.0)
-        double gr = 1.0;     // current gain reduction (<= 1)
-        double atkA = 0.0;   // attack smoothing coeff
-        double relA = 0.0;   // release smoothing coeff
+        int w = 0, r = 0, size = 64;
+        double target = 5.0, gr = 1.0, atkA = 0.0, relA = 0.0;
 
         void setup(double sr, double look_ms = 0.75, double atk_ms = 0.10, double rel_ms = 80.0, double targetVolts = 5.0) {
             target = targetVolts;
-            // clamp sizes
             int req = (int)std::lround(sr * (look_ms * 0.001));
             size = std::min(kMax - 1, std::max(8, req));
             w = 0;
-            // place read pointer 'size' samples behind (so we can look ahead by 'size')
             r = (kMax - size) % kMax;
             gr = 1.0;
-            // 1-pole coefficients
-            atkA = std::exp(-1.0 / (sr * (atk_ms * 0.001))); // fast toward lower gr
-            relA = std::exp(-1.0 / (sr * (rel_ms * 0.001))); // slow toward higher gr
-            for (int i = 0; i < kMax; ++i) { bufL[i] = bufR[i] = absBuf[i] = 0.0; }
+            atkA = std::exp(-1.0 / (sr * (atk_ms * 0.001)));
+            relA = std::exp(-1.0 / (sr * (rel_ms * 0.001)));
+            for (int i = 0; i < kMax; ++i) bufL[i] = bufR[i] = absBuf[i] = 0.0;
         }
 
         inline void process(double inL, double inR, float& outL, float& outR) {
-            // write newest sample
-            bufL[w] = inL;
-            bufR[w] = inR;
+            bufL[w] = inL; bufR[w] = inR;
             absBuf[w] = std::max(std::abs(inL), std::abs(inR));
 
-            // look ahead: find peak over next 'size' samples (O(size), small)
             double peak = 1e-12;
             int idx = w;
             for (int i = 0; i < size; ++i) {
@@ -164,22 +154,13 @@ private:
                 if (--idx < 0) idx = kMax - 1;
             }
 
-            // desired gain reduction to hit 'target'
             double desired = (peak > 1e-12) ? std::min(1.0, target / peak) : 1.0;
+            if (desired < gr) gr = desired + (gr - desired) * atkA;
+            else              gr = desired + (gr - desired) * relA;
 
-            // smooth: fast when reducing (attack), slow when releasing
-            if (desired < gr)
-                gr = desired + (gr - desired) * atkA;
-            else
-                gr = desired + (gr - desired) * relA;
+            outL = float(bufL[r] * gr);
+            outR = float(bufR[r] * gr);
 
-            // read delayed sample and apply current GR
-            double yL = bufL[r] * gr;
-            double yR = bufR[r] * gr;
-            outL = (float)yL;
-            outR = (float)yR;
-
-            // advance indices
             if (++w >= kMax) w = 0;
             if (++r >= kMax) r = 0;
         }
@@ -187,8 +168,8 @@ private:
 
     LookaheadLimiter limiter_;
 
-    // helpers
-    inline void updateUnisonFromMacro(double mc);
+    // ----- Helpers -----
+    inline void updateUnisonFromMacro(double mc); // legacy thresholds (kept)
     inline double detuneCentsToRatio(double cents) const {
         return std::pow(2.0, cents / 1200.0);
     }
@@ -198,6 +179,15 @@ private:
         const double a = std::fabs(x);
         return (a < 1.0) ? x * (1.0 - (x*x)/3.0) : ((x > 0.0) ? 2.0/3.0 : -2.0/3.0);
     }
+
+    // smoothstep 0..1
+    static inline double sstep(double x) {
+        x = std::max(0.0, std::min(1.0, x));
+        return x * x * (3.0 - 2.0 * x);
+    }
+
+    // Compute per-voice activations for 7 slots given SPREAD a∈[0,1]
+    void computeVoiceActivations_(double a, double act[7]) const;
 
     inline double renderCore(double phase, double dt, double morph01,
                              double timbre01, double& triState,
