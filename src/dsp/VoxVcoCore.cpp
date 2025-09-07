@@ -1,5 +1,7 @@
 #include "VoxVcoCore.hpp"
 #include <cstring> // memset
+#include <algorithm>
+#include <cmath>
 
 namespace vm {
 
@@ -69,7 +71,7 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     chaosAmt_ = P_.macroD;
     fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0)); // hotter top
 
-    // IMPORTANT: width = macroC (no baseline offset) so width can be 0
+    // IMPORTANT: width and detune scale still follow Macro C (previous behavior)
     stereoWidth_       = P_.macroC;        // 0..1
     detuneSpreadCents_ = 30.0 * P_.macroC;
 }
@@ -96,8 +98,19 @@ static inline double morphMix(double a, double b, double x) {
     const double wa = std::cos(0.5 * M_PI * t);
     const double wb = std::sin(0.5 * M_PI * t);
     double y = a * wa + b * wb;
-    const double norm = wa + wb;            // upper bound on the peak if a,b align
-    return (norm > 1e-9) ? (y / norm) : y;  // keeps peak ~1 across the crossfade
+    const double norm = wa + wb;
+    return (norm > 1e-9) ? (y / norm) : y;
+}
+
+// NEW: cheap reflect-based wavefolder (branch-light, no loops).
+// Folds an input of arbitrary amplitude back into [-1, 1].
+static inline double fold_reflect(double x) {
+    // Map to [0,2)
+    double u = x + 1.0;
+    u -= 2.0 * std::floor(u * 0.5);
+    // Reflect second half
+    if (u > 1.0) u = 2.0 - u;
+    return u - 1.0; // back to [-1,1]
 }
 
 double VoxVcoCore::renderCore(double phase, double dt, double morph01,
@@ -136,19 +149,32 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     // Triangle (correct slope 4*dt); peaks at t ≈ 0.5
     triState += (4.0 * dt) * sq50;
     if (triState > 1.2) triState = 1.2; else if (triState < -1.2) triState = -1.2;
-    const double tri = triState;       // ~±1 peak
+    const double tri = triState;
 
     // --- Sine family (phase-align to triangle max at t=0.5) ---
     double tSin = t - 0.25; if (tSin < 0.0) tSin += 1.0;
     const double theta = 2.0 * M_PI * tSin;
     const double sine  = std::sin(theta);     // ±1 peak
 
-    // Phase-distorted sine (use aligned phase too) — still ±1 peak
+    // PD-sine (gentle) — original path
     double ph = tSin + 0.25 * timbre01 * std::sin(theta);
     ph -= std::floor(ph);
     const double sinePD = std::sin(2.0 * M_PI * ph);
 
-    // --- Zone-specific timbre shapes (now amplitude-normalized) ---
+    // ------ NEW aggressive sine fold when MORPH near ends ------
+    // Edge emphasis grows near morph extremes (0 or 1), 0 at center (0.5).
+    const double edge = std::pow(std::min(1.0, std::abs(m - 0.5) * 2.0), 0.8);
+    // Drive rises with TIMBRE^2, boosted near edges; clamped for stability.
+    double drive = 1.0 + (2.0 + 6.0 * edge) * (timbre01 * timbre01);
+    if (drive > 9.0) drive = 9.0;
+
+    // Harder fold of sine; bounded in [-1,1].
+    const double sineFoldHard = fold_reflect(sine * drive);
+
+    // Blend PD-sine → hard-fold with TIMBRE (keeps low-TIMBRE gentle, high-TIMBRE aggressive).
+    const double sineAgg = morphMix(sinePD, sineFoldHard, timbre01);
+
+    // --- Zone-specific timbre shapes (kept normalized) ---
 
     // Triangle curvature: tanh(g*tri)/tanh(g) keeps peak = 1 for any g
     const double gTri = 1.0 + 3.0 * timbre01;
@@ -156,10 +182,13 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
     const double triNL = std::tanh(gTri * tri) * invTanh_gTri;
     const double triShaped = tri * (1.0 - timbre01) + triNL * timbre01;
 
-    // Folded/chaotic from sine: tanh(f*sine)/tanh(f) keeps peak = 1
+    // Soft "fold" from sine via tanh (original), kept as the soft baseline
     const double gFold = 1.0 + 4.0 * timbre01;
     const double invTanh_gFold = 1.0 / std::tanh(gFold);
-    const double folded = std::tanh(gFold * sine) * invTanh_gFold;
+    const double foldedSoft = std::tanh(gFold * sine) * invTanh_gFold;
+
+    // NEW: soft→hard fold crossfade for Zone 3's "folded" endpoint
+    const double foldedAgg = morphMix(foldedSoft, sineFoldHard, timbre01);
 
     // ---------- Smooth crossfades ----------
     auto mixPeakNorm = [](double a, double b, double x) {
@@ -168,24 +197,23 @@ double VoxVcoCore::renderCore(double phase, double dt, double morph01,
         const double wb = std::sin(0.5 * M_PI * u);
         double y = a * wa + b * wb;
         const double norm = wa + wb;
-        return (norm > 1e-9) ? (y / norm) : y; // keeps peaks <= 1 and flatter
+        return (norm > 1e-9) ? (y / norm) : y;
     };
 
     double y = 0.0;
     switch (zone) {
         default:
-        case 0: y = mixPeakNorm(sinePD,    tri,    zf); break; // (aligned)
-        case 1: y = mixPeakNorm(triShaped, saw,    zf); break; // (tri NL normalized)
-        case 2: y = mixPeakNorm(saw,       sq,     zf); break; // (both ±1)
-        case 3: y = mixPeakNorm(sq,        folded, zf); break; // (fold normalized)
+        case 0: y = mixPeakNorm(sineAgg,    tri,    zf); break; // sine side is now PD→hard-fold by TIMBRE
+        case 1: y = mixPeakNorm(triShaped,  saw,    zf); break;
+        case 2: y = mixPeakNorm(saw,        sq,     zf); break;
+        case 3: y = mixPeakNorm(sq,         foldedAgg, zf); break; // folded side becomes soft→hard by TIMBRE
     }
 
-    // Optional: very light center lift per zone to shave residual wobble (<0.5 dB)
+    // Light mid-comp remains to keep peaks flat across the path
     auto midComp = [](double z, double k){ return 1.0 + k * z * (1.0 - z); };
-    if (zone == 0) y *= midComp(zf, 0.03);  // Sine↔Tri
-    if (zone == 1) y *= midComp(zf, 0.02);  // Tri ↔ Saw
-    if (zone == 2) y *= midComp(zf, 0.015); // Saw ↔ PWM
-    // Zone 3 rarely needs it; add 0.01 if you want it perfectly flat.
+    if (zone == 0) y *= midComp(zf, 0.03);
+    if (zone == 1) y *= midComp(zf, 0.02);
+    if (zone == 2) y *= midComp(zf, 0.015);
 
     return y; // ~±1 peak across the morph
 }
@@ -234,7 +262,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         sumGR += gR[i];
     }
 
-    // Soft floors so we don't explode a channel when everything is hard-panned away
     const double normFloor = 0.25; // ~-12 dB floor
     const double invSumGL = (sumGL > normFloor) ? (1.0 / sumGL) : 1.0;
     const double invSumGR = (sumGR > normFloor) ? (1.0 / sumGR) : 1.0;
@@ -254,9 +281,7 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     prevSync_ = (n > 0 && inL) ? inL[n - 1] : prevSync_;
 
     for (int i = 0; i < n; ++i) {
-        // Sync detection (shared left input):
-        // - Hard: rising past ~+2 V
-        // - Soft: rising zero-crossing (bipolar signals)
+        // Sync detection
         bool hardSync = false, softSync = false;
         if (inL) {
             const float s = inL[i];
@@ -286,9 +311,8 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             double f = baseHz * ratio;
             if (fmEnabled_) {
                 double norm = fast_clip(fmSample / 5.0, -1.0, 1.0);
-                // Hybrid FM depth: mostly absolute (Hz), plus a bit relative to base
                 const double absHz = kFmMaxHz * fmIndex_;
-                const double relHz = baseHz * (1.5 * fmIndex_);   // up to ~1.5× base at full
+                const double relHz = baseHz * (1.5 * fmIndex_);
                 const double devHz = absHz * 0.7 + relHz * 0.3;
                 f += devHz * norm;
             }
@@ -298,10 +322,9 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
             // Hard/soft sync handling
             if (hardSync) {
-                V.phase = 0.0;   // hard reset
-                V.triI *= 0.5;   // tame integrator click
+                V.phase = 0.0;
+                V.triI *= 0.5;
             } else if (softSync) {
-                // gentle pull of phase toward 0 without discontinuity
                 const double k = 0.20;
                 V.phase -= k * V.phase;
                 if (V.phase < 0.0) V.phase += 1.0;
@@ -314,22 +337,18 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                         P_.macroB, P_.macroD,
                                         V.triI, sqForTri);
 
-            // Pan and mix (no /N here; we normalize per-channel by sum of gains)
+            // Pan and mix
             L += y * gL[v];
             R += y * gR[v];
 
             // Advance phase (through-zero OK)
             V.phase += dt;
-            V.phase -= std::floor(V.phase); // wrap to [0,1)
+            V.phase -= std::floor(V.phase);
         }
 
-        // Normalize by channel pan gains so each output sits ~±1 peak,
-        // then scale to volts and clamp gently.
-        double yL = L * invSumGL;
-        double yR = R * invSumGR;
-
-        yL = fast_clip(yL, -1.0, 1.0);
-        yR = fast_clip(yR, -1.0, 1.0);
+        // Normalize by channel pan gains and scale to volts
+        double yL = fast_clip(L * invSumGL, -1.0, 1.0);
+        double yR = fast_clip(R * invSumGR, -1.0, 1.0);
 
         outL[i] = float(yL * kOutGain); // ~±5 V per channel
         outR[i] = float(yR * kOutGain);
