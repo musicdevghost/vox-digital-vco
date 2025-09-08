@@ -6,7 +6,7 @@ namespace layout {
     inline Vec PANEL_SIZE()   { return rack::mm2px(Vec(60.96f, 128.5f)); }
 
     // Big knobs
-    inline Vec KNOB_PITCH()  { return rack::mm2px(Vec(29.308f, 16.679f)); }
+    inline Vec KNOB_PITCH()  { return rack::mm2px(Vec(30.337f, 16.679f)); }
     inline Vec KNOB_MORPH()    { return rack::mm2px(Vec(49.621f, 32.657f)); }
     inline Vec KNOB_SPREAD()    { return rack::mm2px(Vec(30.337f, 48.892f)); }
     inline Vec KNOB_TIMBRE()   { return rack::mm2px(Vec(11.041f, 32.661f)); }
@@ -38,5 +38,5 @@ namespace layout {
 
     // 🔥 Filled pepper overlay anchor (top-left of pepper_fill.svg)
     inline float PEPPER_BRIGHTNESS() { return 0.60f; }
-    inline Vec PEPPER_POS()   { return rack::mm2px(Vec(10.8f, 14.7f)); }
+    inline Vec PEPPER_POS()   { return rack::mm2px(Vec(10.8f, 13.9f)); }
 }
