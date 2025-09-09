@@ -1,418 +1,216 @@
-# VoxAudio — Hardware & VCV Rack Template
+# Vox Digital VCO — Hardware (Daisy Seed) + VCV Rack v2
 
-A clean template for building **Daisy Seed (STM32H750)** firmware and a **VCV Rack v2** plugin with modular DSP cores.
-
-This doc covers:
-
-- Environment setup  
-- Building & flashing the **hardware** target  
-- Building & installing the **VCV Rack** plugin  
-- How to create a **new module** by only touching the DSP core + metadata  
-- What `USE_LTO` does (0 vs 1)  
-- What the `all` target builds  
-- Common pitfalls / troubleshooting
+A clean setup for sharing DSP between **VCV Rack v2** and **Daisy Seed (STM32H750 Rev B)**.  
+Builds are small, **C++17-only**, and run from **inside `hardware/`** with Daisy’s core Makefile.
 
 ---
 
 ## 1) Requirements
 
 ### Toolchain (hardware)
-- **Arm GNU Toolchain** (`arm-none-eabi`) — ensure the `bin` dir is in your `PATH`  
-  You should have: `arm-none-eabi-gcc`, `arm-none-eabi-g++`, `arm-none-eabi-objcopy`, `arm-none-eabi-size`.
-- **dfu-util** (for flashing Daisy Seed)  
-  - macOS: `brew install dfu-util`  
-  - Debian/Ubuntu: `sudo apt-get install dfu-util`  
-  - Windows: use Zadig to install the **WinUSB** driver for the Daisy DFU device.
+- **Arm GNU Toolchain** (`arm-none-eabi`) — put its `bin` in your `PATH`.
+  - Needed tools: `arm-none-eabi-gcc`, `g++`, `size`, `objcopy`, `nm`, `objdump`.
+- **dfu-util** for flashing (or OpenOCD/ST-Link if you prefer).
 
-### Submodules (hardware)
-This template expects **git submodules** for Daisy:
-
-```ini
-[submodule "DaisySP"]
-    path = DaisySP
-    url  = https://github.com/electro-smith/DaisySP
-[submodule "libdaisy"]
-    path = libdaisy
-    url  = https://github.com/electro-smith/libdaisy
+### Submodules (repo root)
+This repo assumes submodules are checked out at the root:
 ```
-
-Initialize them once:
-
+libdaisy/   (Electro-Smith libDaisy)
+DaisySP/    (DSP helper library)
+src/dsp/    (shared DSP used by Rack + hardware)
+hardware/   (firmware: Makefile + main.cpp)
+```
+Initialize once:
 ```bash
 git submodule update --init --recursive
 ```
 
-> The hardware Makefile includes headers from `../libdaisy` and `../DaisySP` and links to `../libdaisy/build` and `../DaisySP/build`.
-
 ### VCV Rack SDK (plugin)
-- VCV Rack **v2** SDK (or full Rack source). Set one of:
-  - `RACK_SDK=/path/to/Rack-SDK` **or**
-  - `RACK_DIR=/path/to/Rack` (built Rack repo)
-
----
-
-## 2) First-time setup
-
+Install the Rack **v2** SDK (or use a built Rack repo) and set exactly one:
 ```bash
-# From repo root — build Daisy dependencies (once, or when submodules update)
-make -C libdaisy
-make -C DaisySP
-```
-
-> The hardware Makefile also has a `libs` target and will build these automatically on first `make`.
-
----
-
-## 3) Building the hardware target (Daisy Seed)
-
-From the `hardware/` folder:
-
-```bash
-# Default build = release + LTO
-make
-```
-
-Debug build (easier to step through, no LTO):
-
-```bash
-make BUILD=debug USE_LTO=0 all
-```
-
-Other handy targets:
-
-```bash
-make clean     # wipe build/
-make size      # code size report (after linking)
-make flash     # flash to Daisy via dfu-util
-```
-
-### Flashing the Daisy
-1. Put the Seed in DFU mode: hold **BOOT**, tap **RESET**, release **BOOT**.  
-2. Then:
-
-```bash
-make flash
-```
-
-This runs:
-
-```
-dfu-util -a 0 -s 0x08000000:leave -D build/VoxAudioHW.bin
-```
-
-**Hardware entry point** is `hardware/main.cpp`. It calls your selected DSP core with **non-interleaved** buffers:
-```cpp
-core.processBlock(in[0], in[1], out[0], out[1], size);
-```
-
----
-
-## 4) Building the VCV Rack plugin
-
-From repo root:
-
-```bash
-# Either set RACK_SDK (recommended)...
 export RACK_SDK=/path/to/Rack-SDK
-# ...or set RACK_DIR to a built Rack repo
-# export RACK_DIR=/path/to/Rack
+# or
+export RACK_DIR=/path/to/Rack   # built Rack source tree
+```
 
+---
+
+## 2) Shared DSP layout
+
+Your DSP lives in `src/dsp/`. Important files:
+```
+src/dsp/
+├─ IDspCore.hpp
+├─ Platform.hpp
+├─ VoxVcoCore.hpp / .cpp
+└─ SelectedCore.hpp     # selects the core type for hardware
+```
+`SelectedCore.hpp` keeps hardware glue trivial:
+```cpp
+#pragma once
+#include "dsp/VoxVcoCore.hpp"
+namespace vm { using SelectedCore = VoxVcoCore; }
+```
+
+> Note: because `SelectedCore.hpp` uses `#include "dsp/VoxVcoCore.hpp"`, the **repo root** and **src** are on the include path in the hardware Makefile (`-I.. -I../src -I../src/dsp`). No relative `../` includes needed in your DSP headers.
+
+---
+
+## 3) Hardware build (Daisy Seed)
+
+All commands run from **inside** `hardware/`.
+
+### Quick start
+```bash
 make clean
-make -j$(nproc)
-make install
+make          # builds with C++17, links with Daisy core; prints memory usage
+make flash    # DFU flash (BOOT + RESET on the Seed to enter DFU)
+make size     # Berkeley + SysV section sizes
+make verify   # checks unresolveds + no heap CALLS inside src/dsp/*.cpp
 ```
 
-Create a distributable ZIP:
-```bash
-make dist
-# Produces: dist/<slug>-<version>-<platform>.vcvplugin
+### What the Makefile does
+- Includes Daisy’s **core** Makefile (like official examples) → correct HAL/CMSIS paths, startup, and linker script for **STM32H750**.
+- Forces **C++17** via `CPP_STANDARD = -std=gnu++17` (no C++20/Concepts).
+- Builds **directly from your shared DSP**: `../src/dsp/*.cpp` (no duplication).
+- Prints a Daisy-style **region usage table** after link (`--print-memory-usage`).
+- `make verify`:
+  - Fails on **unresolved externals** in the final ELF.
+  - Scans **only your DSP objects** (`../src/dsp/*.cpp`) with `objdump` and fails **only if there are call sites** to `operator new/delete` (no false positives from libsupc++ being *present* but unused).
+
+### Hardware wiring
+
+`hardware/main.cpp` initializes Seed at **48 kHz**, **stereo**, **blocksize ~48**, and calls your core through the selector:
+
+```cpp
+#include "SelectedCore.hpp"
+using CoreT = vm::SelectedCore;
+static CoreT core;
+
+// default signature: processBlock(inL,inR,outL,outR,n)
 ```
 
-> If you see a stray Homebrew `-L/opt/homebrew/opt/postgresql@14/lib` warning, you can run:
-> `LDFLAGS= make` (clears inherited LDFLAGS) — purely cosmetic.
+Two compile-time options:
+- **Default** (core expects inputs):
+  ```bash
+  make
+  ```
+- **No inputs** (core has `process(outL,outR,n)`):
+  ```bash
+  make DEFS_EXTRA="-DVM_CORE_PROCESS_NAME=process -DVM_CORE_HAS_INPUTS=0"
+  ```
+
+Your four parameters (pitch, timbre, morph, spread) are available in `main.cpp` to map ADCs later (currently stubbed). A soft-saturation path is available for a minimal “alive” sound if you ever compile without the core.
 
 ---
 
-## 5) Template structure (Rack side)
+## 4) VCV Rack v2 build
 
-```
-src/
-├─ dsp/
-│  ├─ IDspCore.hpp           # tiny interface used by all modules
-│  ├─ VoxAudioCore.{hpp,cpp} # example core
-│  └─ SelectedCore.hpp       # (optional) alias for hardware builds
-├─ framework/
-│  ├─ TemplateIO.hpp         # shared enums (Params/Inputs/Outputs/Lights)
-│  ├─ TemplateModule.hpp     # minimal glue: smoothing + DSP call
-│  ├─ TemplateWidget.hpp     # generic widget (no hardcoded positions)
-│  └─ PepperOverlay.hpp      # optional overlay (reused by all modules)
-├─ Components.hpp            # knobs/ports/screws from your project
-├─ Layout12HP.hpp            # ALL positions centralized here
-├─ ui.hpp                    # SVG helpers
-├─ plugin.cpp/.hpp           # model registration via template
-res/
-└─ plugin.json               # module entries (slug,name,desc,tags)
-hardware/
-└─ Makefile, main.cpp        # Daisy Seed build + entry-point
-```
-
-**UI is generic and layout-driven:**  
-Edit **only** `Layout12HP.hpp` if you want to move controls. Pepper overlay is controlled by:
-
-```cpp
-inline math::Vec PEPPER_POS()       { return rack::mm2px({10.8f, 14.7f}); }
-inline float     PEPPER_BRIGHTNESS(){ return 0.60f; } // 0..1
-```
-
----
-
-## 6) Create a new module (minimal steps)
-
-> Goal: Only implement the DSP core + add minimal metadata. No UI/layout changes.
-
-### Step A — Add your DSP core
-Create `src/dsp/VoxFilterCore.{hpp,cpp}` implementing `IDspCore`:
-
-```cpp
-// src/dsp/VoxFilterCore.hpp
-#pragma once
-#include "IDspCore.hpp"
-#include <cmath>
-
-struct VoxFilterCore : public IDspCore {
-    void init(double sr) override { sr_ = sr; reset(); }
-    void reset() override { lpL_ = lpR_ = 0.f; params_ = {0.5f, 1.0f, 0.5f, 0.0f}; }
-    void setParams(const Params& p) override { params_ = p; }
-
-    void processBlock(const float* inL, const float* inR,
-                      float* outL, float* outR, size_t n) override {
-        float fc = 200.f * std::pow(60.f, params_.tone);             // 200..12k
-        float a  = 1.f - std::exp(-6.2831853f * fc / (float)sr_);
-        float dry = 1.f - params_.dryWet, wet = params_.dryWet;
-        float drive = 1.f + 2.f * params_.macro;
-
-        for (size_t i=0;i<n;++i) {
-            float L = inL ? inL[i] : 0.f, R = inR ? inR[i] : 0.f;
-            lpL_ += a * (L - lpL_); lpR_ += a * (R - lpR_);
-            float WL = std::tanh(drive * lpL_) * params_.gain;
-            float WR = std::tanh(drive * lpR_) * params_.gain;
-            outL[i] = dry * L + wet * WL;
-            outR[i] = dry * R + wet * WR;
-        }
-    }
-private:
-    double sr_ = 48000.0;
-    float  lpL_ = 0.f, lpR_ = 0.f;
-    Params params_{};
-};
-```
-
-```cpp
-// src/dsp/VoxFilterCore.cpp
-#include "VoxFilterCore.hpp" // header-only; cpp exists for some build globbing
-```
-
-### Step B — Register the module (2 lines in `src/plugin.cpp`)
-```cpp
-#include "dsp/VoxAudioCore.hpp"
-#include "dsp/VoxFilterCore.hpp"   // add this
-
-#define REGISTER_VOX_MODULE(ClassName, CoreType, slug)     using ClassName = VoxTemplateModule<CoreType>;          Model* model##ClassName = createModel<ClassName, VoxTemplateWidget>(slug)
-
-Plugin* pluginInstance = nullptr;
-REGISTER_VOX_MODULE(VoxAudio,  VoxAudioCore,  "vox-audio");
-REGISTER_VOX_MODULE(VoxFilter, VoxFilterCore, "vox-filter");  // add this
-
-void init(Plugin* p) {
-    pluginInstance = p;
-    p->addModel(modelVoxAudio);
-    p->addModel(modelVoxFilter);   // add this
-}
-```
-
-### Step C — Add a module entry to `plugin.json`
-```json
-{
-  "slug": "vox-filter",
-  "name": "VoxFilter",
-  "description": "Stereo filter with tone/macro.",
-  "tags": ["Filter","Stereo"]
-}
-```
-
-### Build for Rack
+From repo root (with `RACK_SDK` or `RACK_DIR` set):
 ```bash
-make clean && make && make install
-```
-
-**That’s it.** UI/layout/overlay all reuse the template.
-
----
-
-## 7) Hardware: select a core without touching `main.cpp`
-
-Keep `hardware/main.cpp` fixed by using an alias:
-
-```cpp
-// src/dsp/SelectedCore.hpp
-#pragma once
-#include "VoxFilterCore.hpp"   // or VoxAudioCore, etc.
-using SelectedCore = VoxFilterCore;
-```
-
-```cpp
-// hardware/main.cpp
-#include "../src/dsp/SelectedCore.hpp"
-SelectedCore core;   // never changes again
-```
-
-Build & flash:
-
-```bash
-cd hardware
 make clean
-make
-make flash   # DFU (hold BOOT, tap RESET, release BOOT)
+make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
+make install     # copies plugin to Rack user plugins folder
+make dist        # packages dist/<slug>-<version>-<platform>.vcvplugin
 ```
 
 ---
 
-## 8) What does `USE_LTO` do?
+## 5) Overriding the core/type/signature (optional)
 
-**LTO = Link Time Optimization.** Optimizes across files at link time.
-
-- `USE_LTO=1` (default in release)
-  - **Pros:** smaller/faster firmware via cross-file inlining & DCE.
-  - **Cons:** slower links; debugging optimized code is harder.
-- `USE_LTO=0`
-  - **Pros:** faster builds; friendlier debugging (symbols map neatly).
-  - **Cons:** bigger/slightly slower binaries.
-
-**Recommendation:** use `release + LTO` for day-to-day, `debug + no LTO` for tricky debugging.
-
----
-
-## 9) What does the `all` target build?
-
-`make` (or `make all`) produces:
-
-- `build/VoxAudioHW.elf` — linked ELF (with symbols)  
-- `build/VoxAudioHW.hex` — Intel HEX  
-- `build/VoxAudioHW.bin` — raw binary (used by `make flash`)
-
----
-
-## 10) Troubleshooting
-
-**“No such file or directory: `/Makefile`” when running `make` in `hardware/`**  
-You’re including libDaisy’s makefile without `LIBDAISY_DIR` set.  
-This template **does not** include libDaisy’s makefile; it links to prebuilt archives and supplies the includes directly.
-
-**`usbh_def.h` or other USB/FatFs headers missing**  
-This template mirrors Illusions’ includes:
-```
-../libdaisy/src/usbd
-../libdaisy/src/usbh
-../libdaisy/Middlewares/ST/STM32_USB_Device_Library/Core/Inc
-../libdaisy/Middlewares/ST/STM32_USB_Host_Library/Core/Inc
-../libdaisy/Middlewares/ST/STM32_USB_Host_Library/Class/MSC/Inc
-../libdaisy/Middlewares/ST/STM32_USB_Host_Library/Class/MIDI/Inc
-../libdaisy/Middlewares/Third_Party/FatFs/src
-```
-If you’re on a different libDaisy revision, adjust these paths to match.
-
-**Link warnings `_write/_read/_close` “will always fail”**  
-Benign with `--specs=nosys.specs`. Ignorable unless you’re calling POSIX I/O.
-
-**DFU can’t find device**  
-Re-enter DFU (hold **BOOT**, tap **RESET**, release **BOOT**), try a different USB-C cable/port, avoid hubs. On Windows, install WinUSB driver for DFU using Zadig.
-
-**Rack build inherits noisy Homebrew `LDFLAGS`**  
-Run `LDFLAGS= make` (clears inherited flags) or filter in your Rack Makefile.
-
----
-
-## 11) Make this a GitHub “Template repository”
-
-On GitHub: **Settings → General → Template repository → Enable**.  
-Description: *“Voxmachina Rack + Daisy template. Add modules by writing a Core.”*
-
----
-
-## 12) Optional helper: scaffold a module
-
-Add `scripts/new_module.sh`:
-
+You can override the defaults **without editing code**:
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-NAME_PASCAL="$1"                               # e.g. VoxFilter
-CORE="${NAME_PASCAL#Vox}Core"                  # FilterCore
-SLUG="vox-$(echo "$NAME_PASCAL" | sed 's/^Vox//; s/\([A-Z]\)/-\L\1/g; s/^-//')"
+# Different type (fully-qualified ok)
+make DEFS_EXTRA="-DVM_CORE_TYPE='my::ns::MyCore'"
 
-HPP="src/dsp/${CORE}.hpp"; CPP="src/dsp/${CORE}.cpp"
-mkdir -p src/dsp
+# Different process name
+make DEFS_EXTRA="-DVM_CORE_PROCESS_NAME=process"
 
-cat > "$HPP" <<'EOF'
-#pragma once
-#include "IDspCore.hpp"
-#include <cmath>
-struct __CLASS__ : public IDspCore {
-  void init(double sr) override { sr_ = sr; reset(); }
-  void reset() override { zL_=zR_=0.f; params_={0.5f,1.0f,0.5f,0.0f}; }
-  void setParams(const Params& p) override { params_ = p; }
-  void processBlock(const float* inL, const float* inR, float* outL, float* outR, size_t n) override {
-    float fc = 200.f * std::pow(60.f, params_.tone);
-    float a  = 1.f - std::exp(-6.2831853f * fc / (float)sr_);
-    for (size_t i=0;i<n;++i) {
-      float L = inL ? inL[i] : 0.f, R = inR ? inR[i] : 0.f;
-      zL_ += a * (L - zL_); zR_ += a * (R - zR_);
-      float WL = zL_ * params_.gain, WR = zR_ * params_.gain;
-      outL[i] = (1.f-params_.dryWet)*L + params_.dryWet*WL;
-      outR[i] = (1.f-params_.dryWet)*R + params_.dryWet*WR;
-    }
-  }
-private:
-  double sr_=48000.0; float zL_=0.f,zR_=0.f; Params params_{};
-};
-EOF
-sed -i '' "s/__CLASS__/${CORE}/g" "$HPP"
+# No inputs + different name
+make DEFS_EXTRA="-DVM_CORE_PROCESS_NAME=process -DVM_CORE_HAS_INPUTS=0"
 
-cat > "$CPP" <<EOF
-#include "${CORE}.hpp"
-EOF
-
-# Register in plugin.cpp and plugin.json
-perl -0777 -pe '
-  s!(#include "dsp/.*VoxAudioCore\.hpp".*)!$1\n#include "dsp/'"$CORE"'.hpp'!s;
-  s!(REGISTER_VOX_MODULE\(VoxAudio.*\);)!$1\nREGISTER_VOX_MODULE('"$NAME_PASCAL"', '"$CORE"', "'"$SLUG"'");!s;
-  s!(p->addModel\(modelVoxAudio\);)!$1\n    p->addModel(model'"$NAME_PASCAL"');!s;
-' -i '' src/plugin.cpp
-
-python3 - <<PY
-import json,sys
-p="plugin.json"
-data=json.load(open(p))
-data.setdefault("modules",[]).append({
-  "slug":"$SLUG","name":"$NAME_PASCAL",
-  "description":"$NAME_PASCAL module.","tags":["Stereo"]
-})
-json.dump(data,open(p,"w"),indent=2); print("Updated plugin.json")
-PY
-
-echo "Scaffolded $NAME_PASCAL → $CORE (slug: $SLUG)."
+# Force-include a specific header (if your filename differs)
+make HEADERS_FORCE=../src/dsp/SelectedCore.hpp
 ```
 
-Make it executable and use:
-```bash
-chmod +x scripts/new_module.sh
-scripts/new_module.sh VoxFilter
-make -j$(nproc) && make install
-# Firmware:
-sed -i '' 's/using SelectedCore = .*/using SelectedCore = VoxFilterCore;/' src/dsp/SelectedCore.hpp
-( cd hardware && make clean && make && make flash )
+Defaults used by the Makefile:
+```
+-DVM_USE_SHARED_CORE=1
+-DVM_CORE_TYPE='vm::SelectedCore'
+-DVM_CORE_PROCESS_NAME=processBlock
+-DVM_CORE_HAS_INPUTS=1
+-DVM_SR=48000 -DVM_BLOCKSIZE=48
 ```
 
 ---
 
-Happy patching!
+## 6) Memory and size visibility
+
+After link, the toolchain prints a region table like:
+```
+Memory region   Used Size  Region Size  %age Used
+FLASH:             95800 B       128 KB    73.1%
+SRAM:              19928 B       512 KB     3.8%
+RAM_D2:               16 KB      288 KB     5.6%
+...
+```
+Use `make size` for detailed section sizes (Berkeley + SysV).
+
+---
+
+## 7) “No heap in audio” policy
+
+- `make verify` **passes** unless your **DSP objects** actually call `operator new/delete`.  
+- Typical culprits if it fails: `std::vector`, `std::string`, `std::function`, dynamic `new`/`delete`.  
+- Fix by switching to `std::array`, fixed pools, ring buffers, or static workspaces.
+
+---
+
+## 8) Troubleshooting
+
+**Header not found / type not found (`'vox' does not name a type`)**  
+- Ensure your header is included (we include `SelectedCore.hpp` directly).
+- Verify the **include paths** (`-I.. -I../src -I../src/dsp`) and the **type macro**:
+  ```bash
+  make DEFS_EXTRA="-DVM_CORE_TYPE='vm::SelectedCore'"
+  ```
+
+**SelectedCore.hpp can’t find `dsp/VoxVcoCore.hpp`**  
+- That path is relative to repo root; keep `-I../src` in the Makefile (already added).
+
+**Verify flags `_ZdlPv` / `_Znwm`**  
+- That means an actual call site exists **inside your DSP TU(s)**. Replace dynamic allocations and STL containers that allocate. Re-run `make verify` to confirm.
+
+**DFU not detected**  
+- Enter DFU (hold **BOOT**, tap **RESET**, release **BOOT**). Try a different cable/port. On Windows, install WinUSB for the DFU device via Zadig.
+
+**Toolchain warnings like `_read/_write will always fail`**  
+- Benign with `--specs=nosys.specs`; they’re GC’d if unused.
+
+**Homebrew adds odd linker flags**  
+- Run `LDFLAGS= make` to clear inherited env flags.
+
+---
+
+## 9) File map (quick reference)
+
+```
+repo-root/
+├─ libdaisy/             (submodule)
+├─ DaisySP/              (submodule)
+├─ src/
+│  └─ dsp/
+│     ├─ IDspCore.hpp
+│     ├─ VoxVcoCore.hpp / .cpp
+│     └─ SelectedCore.hpp
+└─ hardware/
+   ├─ Makefile           (uses Daisy core Makefile; C++17; shared DSP)
+   └─ main.cpp           (48kHz, stereo, block 48; calls SelectedCore)
+```
+
+---
+
+## 10) Credits / License
+
+- Daisy platform © Electro-Smith (libDaisy, DaisySP).  
+- This template: MIT (unless specified otherwise in the repo).
