@@ -51,18 +51,18 @@ struct VoxTemplateModule : rack::engine::Module {
         // --- Control block (@~1kHz) ---
         if (ctrlCountdown_-- <= 0) {
             pNext_ = readParams();
-            pDelta_.dryWet = (pNext_.dryWet - pCur_.dryWet) / (float)ctrlBlock_;
-            pDelta_.gain   = (pNext_.gain   - pCur_.gain  ) / (float)ctrlBlock_;
-            pDelta_.tone   = (pNext_.tone   - pCur_.tone  ) / (float)ctrlBlock_;
-            pDelta_.macro  = (pNext_.macro  - pCur_.macro ) / (float)ctrlBlock_;
+            pDelta_.pitch = (pNext_.pitch - pCur_.pitch) / (float)ctrlBlock_;
+            pDelta_.timbre   = (pNext_.timbre   - pCur_.timbre  ) / (float)ctrlBlock_;
+            pDelta_.morph   = (pNext_.morph   - pCur_.morph  ) / (float)ctrlBlock_;
+            pDelta_.spread  = (pNext_.spread  - pCur_.spread ) / (float)ctrlBlock_;
             ctrlCountdown_ = ctrlBlock_;
         }
 
         // per-sample ramp and set to core
-        pCur_.dryWet += pDelta_.dryWet;
-        pCur_.gain   += pDelta_.gain;
-        pCur_.tone   += pDelta_.tone;
-        pCur_.macro  += pDelta_.macro;
+        pCur_.pitch += pDelta_.pitch;
+        pCur_.timbre   += pDelta_.timbre;
+        pCur_.morph   += pDelta_.morph;
+        pCur_.spread  += pDelta_.spread;
 
         if (inputs[INPUT_CV_PITCH].isConnected()) {
             const float att = clamp(params[PARAM_ATT_PITCH].getValue(), -1.f, 1.f);
@@ -137,12 +137,12 @@ private:
 
         // --- Macros ---
         // Macro A (PITCH knob) -> ±12 semitone offset in the core.
-        p.dryWet = clamp(get(PARAM_PITCH), 0.f, 1.f);
+        p.pitch = clamp(get(PARAM_PITCH), 0.f, 1.f);
 
         // Macro B/C/D
-        p.gain   = clamp(get(PARAM_MORPH) + 2.f * get(PARAM_ATT_MORPH) * sampleCv(INPUT_CV_MORPH),   0.f, 2.f);
-        p.tone   = clamp(get(PARAM_SPREAD) + get(PARAM_ATT_SPREAD) * sampleCv(INPUT_CV_SPREAD), 0.f, 1.f);
-        p.macro  = clamp(get(PARAM_TIMBRE) + get(PARAM_ATT_TIMBRE) * sampleCv(INPUT_CV_TIMBRE), 0.f, 1.f);
+        p.timbre  = clamp(get(PARAM_MORPH) + 2.f * get(PARAM_ATT_MORPH) * sampleCv(INPUT_CV_MORPH),   0.f, 2.f);
+        p.morph   = clamp(get(PARAM_SPREAD) + get(PARAM_ATT_SPREAD) * sampleCv(INPUT_CV_SPREAD), 0.f, 1.f);
+        p.spread  = clamp(get(PARAM_TIMBRE) + get(PARAM_ATT_TIMBRE) * sampleCv(INPUT_CV_TIMBRE), 0.f, 1.f);
 
         return p;
     }

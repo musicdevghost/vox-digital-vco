@@ -64,10 +64,10 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     double m[4] = { p.macros[0], p.macros[1], p.macros[2], p.macros[3] };
     const bool macrosProvided = (m[0] != 0.0 || m[1] != 0.0 || m[2] != 0.0 || m[3] != 0.0);
     if (!macrosProvided) {
-        m[0] = p.dryWet; // Macro A
-        m[1] = p.gain;   // Macro B (UI 0..2)
-        m[2] = p.tone;   // Macro C
-        m[3] = p.macro;  // Macro D
+        m[0] = p.pitch;     // Macro A
+        m[1] = p.timbre;    // Macro B (UI 0..2)
+        m[2] = p.morph;     // Macro C
+        m[3] = p.spread;    // Macro D
     }
 
     const double mA      = fast_clip(m[0], 0.0, 1.0);
