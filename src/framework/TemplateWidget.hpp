@@ -6,6 +6,7 @@
 #include "PepperOverlay.hpp"
 #include "../ui.hpp"
 #include <componentlibrary.hpp>
+#include "VoxScrew.hpp"
 
 using namespace rack;
 
@@ -15,10 +16,27 @@ struct VoxTemplateWidget : app::ModuleWidget {
         setPanel(trySvg("res/faceplate.svg", "res/ComponentLibrary/Panel.svg"));
 
         // Screws
-        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, 0)));
-        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, 0)));
-        addChild(createWidget<ScrewSilver>(Vec(RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
-        addChild(createWidget<ScrewSilver>(Vec(box.size.x - 2 * RACK_GRID_WIDTH, RACK_GRID_HEIGHT - RACK_GRID_WIDTH)));
+        // How much to move (in mm)
+        static constexpr float kTopDropMM    = 2.725f;   // move TOP screws down
+        static constexpr float kBottomRiseMM = -2.325f;   // move BOTTOM screws up
+
+        // Precompute nudges in px
+        const float topDropPx    = mm2px(kTopDropMM);
+        const float bottomRisePx = mm2px(kBottomRiseMM);
+
+        // X positions stay the same
+        const float xLeft  = RACK_GRID_WIDTH;
+        const float xRight = box.size.x - 1 * RACK_GRID_WIDTH;
+
+        // Y bases are the usual grid anchors
+        const float yTopBase    = 0.f;
+        const float yBottomBase = RACK_GRID_HEIGHT - RACK_GRID_WIDTH;
+
+        // Place with nudges
+        addChild(createWidget<VoxScrew>(rack::Vec(xLeft,  yTopBase    + topDropPx)));
+        addChild(createWidget<VoxScrew>(rack::Vec(xRight, yTopBase    + topDropPx)));
+        addChild(createWidget<VoxScrew>(rack::Vec(xLeft,  yBottomBase - bottomRisePx)));
+        addChild(createWidget<VoxScrew>(rack::Vec(xRight, yBottomBase - bottomRisePx)));
 
         // Pepper overlay (auto-skips if svg missing)
         addChild(new PepperOverlay());
