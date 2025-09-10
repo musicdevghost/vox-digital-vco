@@ -3,7 +3,7 @@
 #include "../framework/TemplateModule.hpp"
 
 // NEW: digital VCO core
-#include "../dsp/VoxVcoCore.hpp"
+#include "dsp/VoxVcoCore.hpp"
 
 #define REGISTER_VOX_MODULE(ClassName, CoreType, slug) \
     using ClassName = VoxTemplateModule<CoreType>;      \
