@@ -1,6 +1,6 @@
 // VoxScrew.hpp
 #pragma once
-#include "plugin.hpp"
+#include "../rack/plugin.hpp"
 
 struct VoxScrew : rack::Widget {
     rack::SvgWidget* bg = nullptr;

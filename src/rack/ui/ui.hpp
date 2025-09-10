@@ -1,5 +1,5 @@
 #pragma once
-#include "plugin.hpp"
+#include "../plugin.hpp"
 
 inline std::shared_ptr<window::Svg> trySvg(const std::string& relPath, const std::string& systemFallback) {
     std::shared_ptr<window::Svg> svg;

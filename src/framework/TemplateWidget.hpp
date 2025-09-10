@@ -1,10 +1,10 @@
 #pragma once
-#include "plugin.hpp"
-#include "../Components.hpp"
-#include "../Layout12HP.hpp"
+#include "../rack/plugin.hpp"
+#include "../rack/ui/Components.hpp"
+#include "../rack/ui/Layout12HP.hpp"
 #include "TemplateIO.hpp"
 #include "PepperOverlay.hpp"
-#include "../ui.hpp"
+#include "../rack/ui/ui.hpp"
 #include <componentlibrary.hpp>
 #include "VoxScrew.hpp"
 

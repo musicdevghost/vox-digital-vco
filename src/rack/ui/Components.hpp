@@ -1,5 +1,5 @@
 #pragma once
-#include "plugin.hpp"
+#include "../plugin.hpp"
 #include "ui.hpp"
 
 struct BananutBlackPort : app::SvgPort {

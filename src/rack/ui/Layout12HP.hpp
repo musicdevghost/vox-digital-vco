@@ -1,5 +1,5 @@
 #pragma once
-#include "plugin.hpp"
+#include "../plugin.hpp"
 
 // 12HP = 60.96 mm x 128.5 mm
 namespace layout {

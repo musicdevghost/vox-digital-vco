@@ -1,7 +1,7 @@
 #pragma once
-#include "plugin.hpp"
-#include "../ui.hpp"
-#include "../Layout12HP.hpp"
+#include "../rack/plugin.hpp"
+#include "../rack/ui/ui.hpp"
+#include "../rack/ui/Layout12HP.hpp"
 
 using namespace rack;
 

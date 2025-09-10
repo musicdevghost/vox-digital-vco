@@ -1,9 +1,9 @@
 #include "plugin.hpp"
-#include "framework/TemplateWidget.hpp"
-#include "framework/TemplateModule.hpp"
+#include "../framework/TemplateWidget.hpp"
+#include "../framework/TemplateModule.hpp"
 
 // NEW: digital VCO core
-#include "dsp/VoxVcoCore.hpp"
+#include "../dsp/VoxVcoCore.hpp"
 
 #define REGISTER_VOX_MODULE(ClassName, CoreType, slug) \
     using ClassName = VoxTemplateModule<CoreType>;      \

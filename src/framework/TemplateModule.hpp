@@ -1,5 +1,5 @@
 #pragma once
-#include "plugin.hpp"
+#include "../rack/plugin.hpp"
 #include "TemplateIO.hpp"
 #include <algorithm>
 #include <cmath>
