@@ -119,8 +119,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const uint32_t us1     = System::GetUs();
     const float    used_ms = (us1 - us0) / 1000.f;
     const float    busy    = used_ms / kBlockMs;  // 0..1+
-    // Smooth a bit to avoid flicker
-    const float a = 0.2f;
+    const float    a       = 0.2f;                // smoothing
     busySm += a * (busy - busySm);
     g_hw.seed()->SetLed(busySm > 0.8f);
 #endif
@@ -132,7 +131,8 @@ int main(void)
     const size_t bs = size_t(VM_BLOCKSIZE);
 
     hw::Tunables t;
-    t.smoothAlpha = 0.12f;
+    t.smoothAlpha = -1.f;   // disable legacy alpha
+    t.smoothMs    = 8.0f;   // use time-constant smoothing
     t.envAtkMs    = 8.0f;
     t.envRelMs    = 160.0f;
 

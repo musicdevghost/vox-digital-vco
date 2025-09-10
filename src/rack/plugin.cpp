@@ -1,4 +1,5 @@
 #include "plugin.hpp"
+#include "rack/ftz.hpp"
 #include "../framework/TemplateWidget.hpp"
 #include "../framework/TemplateModule.hpp"
 
@@ -23,6 +24,8 @@ static inline void enableFTZ_DAZ(){
 #endif
 
 void init(Plugin* p) {
+    // Avoid denormal CPU stalls on desktop
+    vm::rackutil::enableFTZ_DAZ();
     pluginInstance = p;
 
     // NEW: register the VCO

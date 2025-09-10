@@ -1,6 +1,4 @@
 #include "Hw.hpp"
-
-// Use the shared parameter helpers
 #include "dsp/shared/ParamMap.hpp"
 
 using namespace daisy;
@@ -25,7 +23,7 @@ void Hw::init(float sr, size_t blocksize, const Tunables& t)
     seed_.Configure();
     seed_.Init();
 
-    // Audio @ 48k, fixed blocksize (Seed helpers)
+    // Audio @ 48k, fixed blocksize
     seed_.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     seed_.SetAudioBlockSize(blocksize_);
     audio_ = seed_.audio_handle;
@@ -45,10 +43,15 @@ void Hw::init(float sr, size_t blocksize, const Tunables& t)
     initAdc_();
     initMux_(0, 0, 0); // reserved
 
-    // Smoothing alphas (use provided smoothAlpha)
-    for (auto& s : sm_knob_) { s.a = tun_.smoothAlpha; }
-    for (auto& s : sm_att_)  { s.a = tun_.smoothAlpha; }
-    for (auto& s : sm_cv_)   { s.a = tun_.smoothAlpha; }
+    // Smoothing: prefer time-constant (ms); fall back to alpha if provided
+    auto init_smoother = [&](vm::OnePole& s){
+        if (tun_.smoothMs > 0.f) s.setTauMs(sr_, tun_.smoothMs);
+        else if (tun_.smoothAlpha >= 0.f) s.setAlpha(tun_.smoothAlpha);
+        else s.setTauMs(sr_, 8.f);
+    };
+    for (auto& s : sm_knob_) init_smoother(s);
+    for (auto& s : sm_att_)  init_smoother(s);
+    for (auto& s : sm_cv_)   init_smoother(s);
 }
 
 void Hw::startAudio(void (*cb)(AudioHandle::InputBuffer,
