@@ -63,8 +63,10 @@ static void TestAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out
 namespace {
 vm::SelectedCore core;        // alias set in dsp/SelectedCore.hpp
 vm::EnvFollower  env;         // AR envelope follower
+#if !VM_CORE_HAS_INPUTS
 static float     zeroL[VM_BLOCKSIZE] = {0.f};
 static float     zeroR[VM_BLOCKSIZE] = {0.f};
+#endif
 } // anon
 
 static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
