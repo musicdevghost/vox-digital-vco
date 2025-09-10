@@ -5,6 +5,20 @@
 
 namespace vm {
 
+// Width rotation that yields mono (L=R=M) at spread=0 and adds ±S as spread increases.
+// c = cos(theta), s = sin(theta), theta in [0, π/2].
+static inline void eqPowerRotate(double M, double S, double spread01, double& L, double& R) {
+    if (spread01 < 0.0) spread01 = 0.0;
+    else if (spread01 > 1.0) spread01 = 1.0;
+    const double theta = spread01 * (0.5 * M_PI);
+    const double c = std::cos(theta);
+    const double s = std::sin(theta);
+    // NOTE: This mapping keeps both channels equal to M at spread=0,
+    // and blends in ±S symmetrically as spread increases.
+    L = c * M + s * S;
+    R = c * M - s * S;
+}
+
 void VoxVcoCore::init(double sampleRate) {
     sr_ = (sampleRate > 0.0) ? sampleRate : 48000.0;
     invSr_ = 1.0 / sr_;
@@ -262,26 +276,11 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     stereoWidthZ_       = aWidth_  * stereoWidthZ_       + (1.0 - aWidth_)  * stereoWidth_;
     detuneSpreadCentsZ_ = aDetune_ * detuneSpreadCentsZ_ + (1.0 - aDetune_) * detuneSpreadCents_;
 
-    // Activations
+    // Activations (smooth unison on/off)
     double act[kMaxUnison];
     computeVoiceActivations_(stereoWidthZ_, act);
 
-    // Pans
-    double gL[kMaxUnison] = {0.0}, gR[kMaxUnison] = {0.0};
-    double sumGL = 0.0, sumGR = 0.0;
-    for (int v = 0; v < kMaxUnison; ++v) {
-        const double basePos = (double(v) - 3.0) / 3.0; // -1..+1
-        const double pan     = basePos * stereoWidthZ_;
-        const double pan01   = 0.5 * (pan + 1.0);
-        gL[v] = equalPowerL(pan01);
-        gR[v] = equalPowerR(pan01);
-        sumGL += gL[v] * act[v];
-        sumGR += gR[v] * act[v];
-    }
-    const double invSumGL = (std::isfinite(sumGL) && sumGL > 1e-6) ? (1.0 / sumGL) : 1.0;
-    const double invSumGR = (std::isfinite(sumGR) && sumGR > 1e-6) ? (1.0 / sumGR) : 1.0;
-
-    // Detunes
+    // Detunes (cents per voice, symmetric)
     double detC[kMaxUnison] = {0.0};
     for (int v = 0; v < kMaxUnison; ++v) {
         const double basePos = (double(v) - 3.0) / 3.0;
@@ -317,7 +316,11 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             if (!std::isfinite(fmSample)) fmSample = 0.0;
         }
 
-        double L = 0.0, R = 0.0;
+        // --- Accumulate raw voice signal into Mid (M) and Side-proxy (S) ---
+        double Msum = 0.0;
+        double Ssum = 0.0;
+        double actSum = 0.0;
+        double sideActSum = 0.0;
 
         // 7-slot engine
         for (int v = 0; v < kMaxUnison; ++v) {
@@ -379,18 +382,37 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                   V.shapeSkew, V.pwmBias + pwmBiasHF);
             if (!std::isfinite(y)) y = 0.0;
 
-            // Pan & mix
+            // --- Accumulate into Mid/Side-proxy using activation weights ---
             const double a = act[v];
-            L += y * gL[v] * a;
-            R += y * gR[v] * a;
+            Msum += y * a;
+            actSum += a;
+
+            // Side sign: left group negative, right group positive, center 0
+            const double basePos = (double(v) - 3.0) / 3.0; // -1..+1
+            const double sgn = (basePos < 0.0) ? -1.0 : (basePos > 0.0 ? 1.0 : 0.0);
+            Ssum += y * a * sgn;
+            if (sgn != 0.0) sideActSum += a;
 
             // Advance phase
             V.phase = newPhase - std::floor(newPhase);
         }
 
+        // Normalize M/S by total activation
+        const double invAct = (actSum > 1e-9) ? (1.0 / actSum) : 0.0;
+        double M = Msum * invAct;
+        double S = Ssum * invAct;
+
+        // Effective spread gates rotation until side voices are active
+        const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
+        const double spreadEff = stereoWidthZ_ * sideRatio;
+
+        // Width rotation to stereo (mono at spread=0, adds ±S as spread↑)
+        double Lrot = 0.0, Rrot = 0.0;
+        eqPowerRotate(M, S, spreadEff, Lrot, Rrot);
+
         // Normalize and scale
-        double yL = L * invSumGL;
-        double yR = R * invSumGR;
+        double yL = Lrot;
+        double yR = Rrot;
         if (!std::isfinite(yL)) yL = 0.0;
         if (!std::isfinite(yR)) yR = 0.0;
 
@@ -428,6 +450,8 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                + kHum60_Level * hum60
                                + kHum2H_Level * std::sin(2.0 * humPhi60_);
 
+            const double dPhi50 = 2.0 * M_PI * 50.0 * invSr_;
+            const double dPhi60 = 2.0 * M_PI * 60.0 * invSr_;
             humPhi50_ += dPhi50; if (humPhi50_ > 2.0 * M_PI) humPhi50_ -= 2.0 * M_PI;
             humPhi60_ += dPhi60; if (humPhi60_ > 2.0 * M_PI) humPhi60_ -= 2.0 * M_PI;
 
