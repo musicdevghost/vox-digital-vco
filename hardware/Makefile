@@ -41,7 +41,8 @@ C_DEFS += \
   -DVM_CORE_TYPE='vm::SelectedCore' \
   -DVM_CORE_PROCESS_NAME=processBlock \
   -DVM_CORE_HAS_INPUTS=1 \
-  -DVM_SR=48000 -DVM_BLOCKSIZE=48
+  -DVM_SR=48000 -DVM_BLOCKSIZE=48 \
+  -DTARGET_DAISY
 
 # Optional: force-include a header if you ever need to
 # make HEADERS_FORCE=../src/dsp/SelectedCore.hpp

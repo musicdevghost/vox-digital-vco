@@ -2,6 +2,7 @@ RACK_DIR ?= $(RACK_SDK)
 
 FLAGS += -std=c++11 -stdlib=libc++ -mmacosx-version-min=10.9 -march=nehalem          -O3 -fPIC -fno-omit-frame-pointer -funsafe-math-optimizations          -Wall -Wextra -Wno-unused-parameter
 FLAGS += -Isrc
+FLAGS += -DTARGET_RACK
 
 SOURCES += $(wildcard src/*.cpp) $(wildcard src/*/*.cpp) $(wildcard src/*/*/*.cpp)
 

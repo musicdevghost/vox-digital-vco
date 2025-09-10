@@ -25,12 +25,12 @@ void Hw::init(float sr, size_t blocksize, const Tunables& t)
     seed_.Configure();
     seed_.Init();
 
-    // Audio @ 48k, fixed blocksize (use Seed helpers in current libDaisy)
+    // Audio @ 48k, fixed blocksize (Seed helpers)
     seed_.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     seed_.SetAudioBlockSize(blocksize_);
     audio_ = seed_.audio_handle;
 
-    // Panel LED on D29 (seed namespace)
+    // Panel LED on D29
     led_.Init(D29, GPIO::Mode::OUTPUT, GPIO::Pull::NOPULL, GPIO::Speed::LOW);
 
     // DAC OUT1 (PA4) — 12-bit, polling, one channel
@@ -43,9 +43,9 @@ void Hw::init(float sr, size_t blocksize, const Tunables& t)
 
     // ADC + mux setup
     initAdc_();
-    initMux_(0, 0, 0); // reserved, ensures symmetry
+    initMux_(0, 0, 0); // reserved
 
-    // Smoothing alphas
+    // Smoothing alphas (use provided smoothAlpha)
     for (auto& s : sm_knob_) { s.a = tun_.smoothAlpha; }
     for (auto& s : sm_att_)  { s.a = tun_.smoothAlpha; }
     for (auto& s : sm_cv_)   { s.a = tun_.smoothAlpha; }
@@ -55,13 +55,12 @@ void Hw::startAudio(void (*cb)(AudioHandle::InputBuffer,
                                AudioHandle::OutputBuffer,
                                size_t))
 {
-    // Prefer Seed helper in current libDaisy
     seed_.StartAudio(cb);
 }
 
 void Hw::initAdc_()
 {
-    // A0..A3 (direct CVs), A5 (MUX1 COM), A6 (MUX2 COM) — seed namespace pins
+    // A0..A3 (direct CVs), A5 (MUX1 COM), A6 (MUX2 COM)
     AdcChannelConfig adc_cfg[6];
     adc_cfg[0].InitSingle(A0); // CV1  → Timbre
     adc_cfg[1].InitSingle(A1); // CV2  → Pitch (V/Oct)
@@ -105,7 +104,6 @@ void Hw::initMux_(int, int, int)
 void Hw::stepMuxes_()
 {
     // Read CURRENT ADC value which corresponds to the PREVIOUS select lines
-    // (one-block latency after channel select update)
     const float m1_read = seed_.adc.GetFloat(adc_m1_);
     const float m2_read = seed_.adc.GetFloat(adc_m2_);
 
@@ -116,9 +114,9 @@ void Hw::stepMuxes_()
     m1_prev_ = m1_curr_;
     m2_prev_ = m2_curr_;
 
-    // Select next channels (we only use 0..3 but keep wrap at 0..7)
-    m1_curr_ = (m1_curr_ + 1u) & 0x7u;
-    m2_curr_ = (m2_curr_ + 1u) & 0x7u;
+    // Select next channels — use only 0..3 to reduce control latency
+    m1_curr_ = (m1_curr_ + 1u) & 0x3u;
+    m2_curr_ = (m2_curr_ + 1u) & 0x3u;
 
     set4051Pins(m1_s0_, m1_s1_, m1_s2_, m1_curr_);
     set4051Pins(m2_s0_, m2_s1_, m2_s2_, m2_curr_);

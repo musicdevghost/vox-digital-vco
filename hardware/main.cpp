@@ -26,6 +26,10 @@ static hw::Hw g_hw;
 #define HW_TEST 0
 #endif
 
+#ifndef VM_CPU_METER
+#define VM_CPU_METER 1
+#endif
+
 // ===== Test mode (simple 440Hz, LED blink, DAC ramp) =====
 #if HW_TEST
 static float phs  = 0.f;
@@ -67,10 +71,18 @@ vm::EnvFollower  env;         // AR envelope follower
 static float     zeroL[VM_BLOCKSIZE] = {0.f};
 static float     zeroR[VM_BLOCKSIZE] = {0.f};
 #endif
+#if VM_CPU_METER
+constexpr float kBlockMs = (float)VM_BLOCKSIZE * 1000.f / float(VM_SR);
+static float    busySm   = 0.f; // smoothed CPU load
+#endif
 } // anon
 
 static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
 {
+#if VM_CPU_METER
+    const uint32_t us0 = System::GetUs();
+#endif
+
     // 1) Advance hardware scanning/mix controls
     g_hw.poll();
 
@@ -101,6 +113,17 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     // 5) Envelope from outputs (8 ms attack / 160 ms release)
     const float e = env.processBlockRmsStereo(out[0], out[1], n);
     g_hw.writeEnv(e);
+
+#if VM_CPU_METER
+    // --- CPU meter: light onboard LED when >80% of block time is used
+    const uint32_t us1     = System::GetUs();
+    const float    used_ms = (us1 - us0) / 1000.f;
+    const float    busy    = used_ms / kBlockMs;  // 0..1+
+    // Smooth a bit to avoid flicker
+    const float a = 0.2f;
+    busySm += a * (busy - busySm);
+    g_hw.seed()->SetLed(busySm > 0.8f);
+#endif
 }
 
 int main(void)
