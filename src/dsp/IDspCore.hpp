@@ -8,8 +8,8 @@ class IDspCore {
 public:
     struct Params {
         // ---- Framework-expected fields (TemplateModule.hpp interpolates these) ----
-        float pitch;  // [0..1]
-        float timbre;    // [0..1]
+        float pitch;    // [0..1]
+        float timbre;   // [0..1]
         float morph;    // [0..1]
         float spread;   // [0..1]
 

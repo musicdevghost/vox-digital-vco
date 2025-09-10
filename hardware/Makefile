@@ -9,9 +9,12 @@
 TARGET = firmware
 
 # App + your shared DSP sources
+# Include both top-level dsp/*.cpp and dsp/cores/*.cpp (new location for cores)
 CPP_SOURCES = \
   main.cpp \
-  $(wildcard ../src/dsp/*.cpp)
+  Hw.cpp \
+  $(wildcard ../src/dsp/*.cpp) \
+  $(wildcard ../src/dsp/cores/*.cpp)
 
 # Submodules at repo root
 LIBDAISY_DIR = ../libdaisy
@@ -59,8 +62,9 @@ size: $(BUILD_DIR)/$(TARGET).elf
 	$(SIZE) -B $<
 	$(SIZE) -A $<
 
-# DSP object list (built names mirror notdir of the sources)
-DSP_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(patsubst %.cpp,%.o,$(wildcard ../src/dsp/*.cpp))))
+# DSP object list (for heap-check). Include cores/*.cpp as well.
+DSP_SRCS := $(wildcard ../src/dsp/*.cpp) $(wildcard ../src/dsp/cores/*.cpp)
+DSP_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(patsubst %.cpp,%.o,$(DSP_SRCS))))
 
 # Verify:
 #  1) No unresolved externals after link (nm -u empty).

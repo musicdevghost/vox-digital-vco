@@ -1,160 +1,125 @@
 #include "daisy_seed.h"
-#include "daisysp.h"
-#include "SelectedCore.hpp"
-#include "pins.hpp"
+#include "Hw.hpp"
 #include <cmath>
 
+#include "dsp/IDspCore.hpp"
+#include "dsp/SelectedCore.hpp"
+#include "dsp/shared/EnvFollower.hpp"
+
 using namespace daisy;
-using namespace daisysp;
+
+static hw::Hw g_hw;
+
+#ifndef VM_SR
+#define VM_SR 48000
+#endif
+
+#ifndef VM_BLOCKSIZE
+#define VM_BLOCKSIZE 48
+#endif
 
 #ifndef VM_CORE_HAS_INPUTS
 #define VM_CORE_HAS_INPUTS 1
 #endif
-#ifndef VM_CORE_PROCESS_NAME
-#define VM_CORE_PROCESS_NAME processBlock
-#endif
+
 #ifndef HW_TEST
 #define HW_TEST 0
 #endif
 
-// Rates / sizes
-static constexpr float  kSr    = 48000.0f;
-static constexpr size_t kBlock = 48;
+// ===== Test mode (simple 440Hz, LED blink, DAC ramp) =====
+#if HW_TEST
+static float phs  = 0.f;
+static float dacv = 0.f;
+static int   blink = 0;
 
-static inline float clamp01(float v){ return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
-static inline float bipolar(float v01){ float x = v01 * 2.f - 1.f; return (x < -1.f) ? -1.f : (x > 1.f ? 1.f : x); }
-
-struct SmoothLP { float y=0.f; float proc(float x,float a){ y += a*(x-y); return y; } };
-
-// Hardware
-DaisySeed        hw;
-GPIO             panelLed;
-
-// ADC: 4 direct + 2 mux entries
-static const int kAdcEntries = 6;
-AdcChannelConfig adc_cfg[kAdcEntries];
-
-// Smoothers
-SmoothLP sm_cv_tim, sm_cv_pitch, sm_cv_spread, sm_cv_morph;
-SmoothLP sm_p_size, sm_p_tone, sm_p_feedb, sm_p_diff;
-SmoothLP sm_at_size, sm_at_tone, sm_at_feedb, sm_at_diff;
-
-// DSP core
-vm::SelectedCore core;
-
-// ENV follower state
-static float envState = 0.f;
-
-// ----- Audio Callback -----
-static void AudioCb(AudioHandle::InputBuffer  in,
-                    AudioHandle::OutputBuffer out,
-                    size_t                    n)
+static void TestAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
 {
-    const float a = 0.12f; // control smoothing
+    (void)in;
+    const float sr  = float(VM_SR);
+    const float inc = 440.f / sr;
 
-    // ---- Read CVs (direct, 0..1) then map to bipolar for modulation ----
-    float cv_tim_b = sm_cv_tim   .proc(bipolar(hw.adc.GetFloat(0)), a); // CV1 → Timbre
-    float cv_pit_b = sm_cv_pitch .proc(bipolar(hw.adc.GetFloat(1)), a); // CV2 → Pitch
-    float cv_spr_b = sm_cv_spread.proc(bipolar(hw.adc.GetFloat(2)), a); // CV3 → Spread
-    float cv_mor_b = sm_cv_morph .proc(bipolar(hw.adc.GetFloat(3)), a); // CV4 → Morph
+    for (size_t i = 0; i < n; ++i)
+    {
+        phs += inc;
+        if (phs >= 1.f) phs -= 1.f;
+        const float s = 0.2f * sinf(2.f * 3.14159265f * phs);
+        out[0][i] = s;
+        out[1][i] = s;
+    }
 
-    // ---- Read MUX 1 (pots) and MUX 2 (attenuverters) ----
-    // Our adc config order: [0..3]=direct CVs, [4]=MUX1, [5]=MUX2
-    // MUX channel indices from schematic: 0=FILTER,1=SIZE,2=FEEDB,3=DIFF
-    float pot_filter = sm_p_tone .proc(hw.adc.GetMuxFloat(4, 0), a); // Tone
-    float pot_size   = sm_p_size .proc(hw.adc.GetMuxFloat(4, 1), a); // Pitch coarse
-    float pot_feedb  = sm_p_feedb.proc(hw.adc.GetMuxFloat(4, 2), a); // Morph
-    float pot_diff   = sm_p_diff .proc(hw.adc.GetMuxFloat(4, 3), a); // Spread
+    // Blink ~2 Hz
+    static int count = 0;
+    if (++count > int(sr / n / 2)) { count = 0; blink ^= 1; }
+    g_hw.seed()->SetLed(blink);
 
-    // Attenuverters as bipolar (−1..+1) so they can invert CVs
-    float at_filter_b = sm_at_tone .proc(bipolar(hw.adc.GetMuxFloat(5, 0)), a); // Timbre CV amt
-    float at_size_b   = sm_at_size .proc(bipolar(hw.adc.GetMuxFloat(5, 1)), a); // Pitch CV amt
-    float at_feedb_b  = sm_at_feedb.proc(bipolar(hw.adc.GetMuxFloat(5, 2)), a); // Morph CV amt
-    float at_diff_b   = sm_at_diff .proc(bipolar(hw.adc.GetMuxFloat(5, 3)), a); // Spread CV amt
+    // DAC ramp 0..1
+    dacv += 0.0025f;
+    if (dacv > 1.f) dacv = 0.f;
+    g_hw.writeEnv(dacv);
+}
+#endif // HW_TEST
 
-    // ---- Build params: knob + (CV * attenuverter) ----
-    vm::IDspCore::Params p{};
-    p.pitch  = clamp01(pot_size   + (cv_pit_b * at_size_b));
-    p.timbre = clamp01(pot_filter + (cv_tim_b * at_filter_b));
-    p.morph  = clamp01(pot_feedb  + (cv_mor_b * at_feedb_b));
-    p.spread = clamp01(pot_diff   + (cv_spr_b * at_diff_b));
+// ===== Production audio callback =====
+namespace {
+vm::SelectedCore core;        // alias set in dsp/SelectedCore.hpp
+vm::EnvFollower  env;         // AR envelope follower
+static float     zeroL[VM_BLOCKSIZE] = {0.f};
+static float     zeroR[VM_BLOCKSIZE] = {0.f};
+} // anon
 
+static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
+{
+    // 1) Advance hardware scanning/mix controls
+    g_hw.poll();
+
+    // 2) Push params to core (using your IDspCore::Params)
+    const auto c = g_hw.controls();
+    vm::IDspCore::Params p;
+    p.pitch       = c.pitch;
+    p.timbre      = c.timbre;
+    p.morph       = c.morph;
+    p.spread      = c.spread;
+    p.pitchVolts  = static_cast<double>(c.pitchVolts);
+    p.macros[0]   = p.macros[1] = p.macros[2] = p.macros[3] = 0.0; // not used here
+    p.fmCablePresent = false; // VoxVcoCore can infer if needed
     core.setParams(p);
 
+    // 3) Prepare pointers (support cores without inputs)
 #if VM_CORE_HAS_INPUTS
-    core.VM_CORE_PROCESS_NAME(in[0], in[1], out[0], out[1], (int)n);
+    const float* inL = in[0];
+    const float* inR = in[1];
 #else
-    core.VM_CORE_PROCESS_NAME(out[0], out[1], (int)n);
+    const float* inL = zeroL;
+    const float* inR = zeroR;
 #endif
 
-    // ---- ENV follower (same feel as your Rack template) ----
-    float peak = 0.f;
-    for(size_t i = 0; i < n; ++i)
-        peak = fmaxf(peak, fmaxf(fabsf(out[0][i]), fabsf(out[1][i])));
-    float amp = peak / 5.f;
-    const float atk = 1.f - expf(-1.f / (0.008f * kSr));
-    const float rel = 1.f - expf(-1.f / (0.160f * kSr));
-    float acoef = (amp > envState) ? atk : rel;
-    envState += acoef * (amp - envState);
-    float env01 = clamp01(envState);
+    // 4) Process with your signature
+    core.processBlock(inL, inR, out[0], out[1], static_cast<int>(n));
 
-    // Panel LED
-    panelLed.Write(env01 > 0.05f);
-
-    // DAC OUT1: write 0..1 to full-scale (external stage lifts to 0..8V)
-    uint16_t code = (uint16_t)(env01 * 4095.0f + 0.5f);
-    hw.dac.WriteValue(DacHandle::Channel::ONE, code);
-}
-
-// ----- Init -----
-static void InitAdc()
-{
-    // 0..3 : direct CVs
-    adc_cfg[0].InitSingle(hwpins::ADC_CV_TIMBRE);
-    adc_cfg[1].InitSingle(hwpins::ADC_CV_PITCH);
-    adc_cfg[2].InitSingle(hwpins::ADC_CV_SPREAD);
-    adc_cfg[3].InitSingle(hwpins::ADC_CV_MORPH);
-
-    // 4 : MUX 1 (pots)
-    adc_cfg[4].InitMux(hwpins::MUX1_COM, 8, hwpins::MUX1_S0, hwpins::MUX1_S1, hwpins::MUX1_S2);
-    // 5 : MUX 2 (attenuverters)
-    adc_cfg[5].InitMux(hwpins::MUX2_COM, 8, hwpins::MUX2_S0, hwpins::MUX2_S1, hwpins::MUX2_S2);
-
-    hw.adc.Init(adc_cfg, kAdcEntries);
-    hw.adc.Start();
-}
-
-static void InitIo()
-{
-    // Panel LED
-    panelLed.Init(hwpins::PANEL_LED, GPIO::Mode::OUTPUT, GPIO::Pull::NOPULL);
-
-    // DAC OUT1 init (PA4)
-    DacHandle::Config dcfg;
-    dcfg.bitdepth   = DacHandle::BitDepth::BITS_12;
-    dcfg.buff_state = DacHandle::BufferState::ENABLED;
-    dcfg.mode       = DacHandle::Mode::POLLING; // simple, low-rate updates OK
-    dcfg.chn        = DacHandle::Channel::BOTH; // we only use Channel ONE
-    hw.dac.Init(dcfg);
-    hw.dac.WriteValue(DacHandle::Channel::ONE, 0);
+    // 5) Envelope from outputs (8 ms attack / 160 ms release)
+    const float e = env.processBlockRmsStereo(out[0], out[1], n);
+    g_hw.writeEnv(e);
 }
 
 int main(void)
 {
-    hw.Configure();
-    hw.Init();
+    const float  sr = float(VM_SR);
+    const size_t bs = size_t(VM_BLOCKSIZE);
 
-    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
-    hw.SetAudioBlockSize(kBlock);
+    hw::Tunables t;
+    t.smoothAlpha = 0.12f;
+    t.envAtkMs    = 8.0f;
+    t.envRelMs    = 160.0f;
 
-    InitAdc();
-    InitIo();
-
-    hw.StartAudio(AudioCb);
+    g_hw.init(sr, bs, t);
 
 #if HW_TEST
-    for(;;){ panelLed.Toggle(); System::Delay(150); }
+    g_hw.startAudio(TestAudio);
 #else
-    for(;;){ System::Delay(1000); }
+    core.init(double(sr));
+    env.setupMs(sr, t.envAtkMs, t.envRelMs);
+    g_hw.startAudio(AudioCb);
 #endif
+
+    while (1) { System::Delay(100); }
 }
