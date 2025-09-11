@@ -1,4 +1,3 @@
-// VoxVcoCore.hpp
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -111,10 +110,18 @@ private:
     static constexpr double kSpreadSlewMs = 10.0;
     static constexpr double kDetuneSlewMs = 25.0;
 
-    // ---- Sub-oscillator behavior ----
-    static constexpr double kSubOnThreshold = 0.10; // add sub when spread < 0.15
-    static constexpr double kSubFadeBW      = 0.05; // smooth fade up to threshold
-    static constexpr double kSubGain        = 0.40; // sub level before normalization
+    // ---- Sub-oscillator behavior (you set these values) ----
+    static constexpr double kSubOnThreshold = 0.15; // add sub when spread < 0.15
+    static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
+    static constexpr double kSubGain        = 0.90; // sub level before normalization
+
+    // ---- Granular behavior (new) ----
+    static constexpr double kGranularOnThreshold = 0.90; // start granular above this
+    static constexpr double kGranularFadeBW      = 0.05; // fade in/out width
+    static constexpr double kGrainMinMs          = 100.0;
+    static constexpr double kGrainMaxMs          = 260.0;
+    static constexpr double kGrainAtkMs          = 12.0;
+    static constexpr double kGrainRelMs          = 12.0;
 
     // ---- State ----
     double sr_ = 48000.0;
@@ -129,6 +136,10 @@ private:
         double shapeSkew = 0.0;
         double jitMF = 0.0;
         double jitLF = 0.0;
+        // Granular per-voice state
+        int    grainPos   = 0;
+        int    grainTotal = 1;
+        double grainPitchRatio = 1.0;
         Lcg rng;
     };
     std::array<Voice, kMaxUnison> voices_{};
@@ -140,9 +151,9 @@ private:
     float prevSync_ = 0.0f;
     OnePoleHP fmHp_;
 
-    // Sub oscillator state (mono sub triangle)
+    // Sub oscillator state (mono sub square)
     double subPhase_ = 0.0;
-    double subTriI_  = 0.0;
+    // (triangle integrator removed from use; kept for potential future)
 
     // ---- Cached params ----
     struct Cached {
@@ -169,6 +180,10 @@ private:
     double detuneSpreadCentsZ_ = 0.0;
     double aWidth_  = 0.0;
     double aDetune_ = 0.0;
+
+    // Granular runtime helpers
+    bool granularWasOn_ = false;
+    int  grainMinS_ = 64, grainMaxS_ = 128, grainAtkS_ = 24, grainRelS_ = 24;
 
     // ---- Stereo look-ahead limiter (safe) ----
     struct LookaheadLimiter {
@@ -259,7 +274,6 @@ private:
         double y = 0.0;
         void setup(double sr, double v_per_ms) {
             step = (v_per_ms > 0.0) ? ((v_per_ms * 1000.0) / sr) : 1e9;
-            // v_per_ms [V/ms] * 1000 = [V/s]; divide by sr -> [V/sample]
             y = 0.0;
         }
         inline double process(double x) {
@@ -284,10 +298,6 @@ private:
     }
     inline double equalPowerL(double pan01) const { return std::cos(0.5 * M_PI * pan01); }
     inline double equalPowerR(double pan01) const { return std::sin(0.5 * M_PI * pan01); }
-    inline double softclip3(double x) const {
-        const double a = std::fabs(x);
-        return (a < 1.0) ? x * (1.0 - (x*x)/3.0) : ((x > 0.0) ? 2.0/3.0 : -2.0/3.0);
-    }
 
     static inline double sstep(double x) { // smoothstep 0..1
         x = std::max(0.0, std::min(1.0, x));

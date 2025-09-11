@@ -1,4 +1,3 @@
-// VoxVcoCore.cpp
 #include "VoxVcoCore.hpp"
 #include <cstring>
 #include <algorithm>
@@ -7,17 +6,25 @@
 namespace vm {
 
 // Width rotation that yields mono (L=R=M) at spread=0 and adds ±S as spread increases.
-// c = cos(theta), s = sin(theta), theta in [0, π/2].
 static inline void eqPowerRotate(double M, double S, double spread01, double& L, double& R) {
     if (spread01 < 0.0) spread01 = 0.0;
     else if (spread01 > 1.0) spread01 = 1.0;
     const double theta = spread01 * (0.5 * M_PI);
     const double c = std::cos(theta);
     const double s = std::sin(theta);
-    // NOTE: This mapping keeps both channels equal to M at spread=0,
-    // and blends in ±S symmetrically as spread increases.
     L = c * M + s * S;
     R = c * M - s * S;
+}
+
+// --- Granular pitch set (intervals in semitones) ---
+static constexpr int kGranNotes[] = { -24, -12, 0, +12, +24 };
+static constexpr int kGranNotesCount = int(sizeof(kGranNotes)/sizeof(kGranNotes[0]));
+
+static inline double pickGranRatio(Lcg& rng) {
+    const uint32_t r = rng.next();
+    const int idx = int(r % kGranNotesCount);
+    const int semis = kGranNotes[idx];
+    return std::pow(2.0, semis / 12.0);
 }
 
 void VoxVcoCore::init(double sampleRate) {
@@ -31,6 +38,10 @@ void VoxVcoCore::init(double sampleRate) {
         const double r2 = voices_[i].rng.bipolar();
         voices_[i].pwmBias   = kAnalogModel ? (kAnalogPwmBiasStd * r1) : 0.0;
         voices_[i].shapeSkew = kAnalogModel ? (kAnalogShapeStd * r2) : 0.0;
+        // Initialize granular state
+        voices_[i].grainTotal = 64;
+        voices_[i].grainPos = i * 7; // small desync
+        voices_[i].grainPitchRatio = 1.0;
     }
 
     aJitMF_ = std::exp(-2.0 * M_PI * 300.0 / sr_);
@@ -53,6 +64,12 @@ void VoxVcoCore::init(double sampleRate) {
     slewL_.setup(sr_, kAnalogModel ? kAnalogSlewVPerMs : 0.0);
     slewR_.setup(sr_, kAnalogModel ? kAnalogSlewVPerMs : 0.0);
 
+    // Precompute grain sample ranges
+    grainMinS_ = std::max(4, int(std::lround(sr_ * (kGrainMinMs * 0.001))));
+    grainMaxS_ = std::max(grainMinS_ + 1, int(std::lround(sr_ * (kGrainMaxMs * 0.001))));
+    grainAtkS_ = std::max(1, int(std::lround(sr_ * (kGrainAtkMs * 0.001))));
+    grainRelS_ = std::max(1, int(std::lround(sr_ * (kGrainRelMs * 0.001))));
+
     reset();
 }
 
@@ -65,6 +82,10 @@ void VoxVcoCore::reset() {
         v.drift = 0.0;
         v.jitMF = 0.0;
         v.jitLF = 0.0;
+        // granular
+        v.grainPos = 0;
+        v.grainTotal = 64;
+        v.grainPitchRatio = 1.0;
     }
     stereoWidthZ_ = 0.0;
     detuneSpreadCentsZ_ = 0.0;
@@ -73,7 +94,8 @@ void VoxVcoCore::reset() {
 
     // Sub-osc state
     subPhase_ = 0.0;
-    subTriI_  = 0.0;
+
+    granularWasOn_ = false;
 }
 
 // Params mapping (unchanged)
@@ -318,7 +340,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         // Sub-oscillator follows sync
         if (hardSync) {
             subPhase_ = 0.0;
-            subTriI_ *= 0.5;
         } else if (softSync) {
             const double k = 0.20;
             subPhase_ -= k * subPhase_;
@@ -330,6 +351,31 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         if (fmEnabled_ && inR) {
             fmSample = fmHp_.process(double(inR[i]));
             if (!std::isfinite(fmSample)) fmSample = 0.0;
+        }
+
+        // --- Granular mix amount based on spread ---
+        double granMix = 0.0;
+        if (stereoWidthZ_ >= (kGranularOnThreshold - kGranularFadeBW)) {
+            const double t = (stereoWidthZ_ - kGranularOnThreshold) / kGranularFadeBW;
+            granMix = sstep(fast_clip(t, 0.0, 1.0)); // 0..1
+        }
+
+        // Rising/falling edge: seed or clear granular grains
+        if (granMix > 0.0 && !granularWasOn_) {
+            for (int v = 0; v < kMaxUnison; ++v) {
+                auto& V = voices_[v];
+                // random duration
+                const int span = std::max(1, grainMaxS_ - grainMinS_);
+                V.grainTotal = grainMinS_ + int(V.rng.next() % uint32_t(span));
+                if (V.grainTotal < 4) V.grainTotal = 4;
+                // random starting position for desync
+                V.grainPos = int(V.rng.next() % uint32_t(V.grainTotal));
+                // random note ratio
+                V.grainPitchRatio = pickGranRatio(V.rng);
+            }
+            granularWasOn_ = true;
+        } else if (granMix <= 0.0 && granularWasOn_) {
+            granularWasOn_ = false;
         }
 
         // --- Accumulate raw voice signal into Mid (M) and Side-proxy (S) ---
@@ -345,10 +391,15 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             // Slow drift depth
             advanceDrift(V, 3.0 + 4.0 * stereoWidthZ_);
             const double cents = detC[v] + V.drift;
-            const double ratio = detuneCentsToRatio(cents);
+            const double normalRatio = detuneCentsToRatio(cents);
+
+            // Pitch ratio crossfade into granular note
+            const double pitchRatioBlend = (granMix > 0.0)
+                ? ((1.0 - granMix) + granMix * V.grainPitchRatio)
+                : 1.0;
 
             // Base + jitter
-            double f = baseHz * ratio;
+            double f = baseHz * normalRatio * pitchRatioBlend;
             if (kAnalogModel && (jitRel != 0.0 || jitAbs != 0.0)) {
                 V.jitMF = aJitMF_ * V.jitMF + (1.0 - aJitMF_) * V.rng.bipolar();
                 V.jitLF = aJitLF_ * V.jitLF + (1.0 - aJitLF_) * V.rng.bipolar();
@@ -398,6 +449,38 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                   V.shapeSkew, V.pwmBias + pwmBiasHF);
             if (!std::isfinite(y)) y = 0.0;
 
+            // Granular amplitude window (attack/release) blended by granMix
+            if (granMix > 0.0) {
+                int N = std::max(4, V.grainTotal);
+                int A = std::min(grainAtkS_, N / 2);
+                int R = std::min(grainRelS_, N / 2);
+                double w = 1.0;
+                if (V.grainPos < A) {
+                    const int d = std::max(1, A);
+                    w = double(V.grainPos) / double(d);
+                } else if (V.grainPos >= (N - R)) {
+                    const int d = std::max(1, R);
+                    w = double(N - V.grainPos) / double(d);
+                } else {
+                    w = 1.0;
+                }
+                if (w < 0.0) w = 0.0; else if (w > 1.0) w = 1.0;
+
+                // Blend windowed level into normal level
+                const double lev = (1.0 - granMix) + granMix * w;
+                y *= lev;
+
+                // Advance grain; re-trigger when done
+                if (++V.grainPos >= N) {
+                    // choose new duration and note
+                    const int span = std::max(1, grainMaxS_ - grainMinS_);
+                    V.grainTotal = grainMinS_ + int(V.rng.next() % uint32_t(span));
+                    if (V.grainTotal < 4) V.grainTotal = 4;
+                    V.grainPos = 0;
+                    V.grainPitchRatio = pickGranRatio(V.rng);
+                }
+            }
+
             // --- Accumulate into Mid/Side-proxy using activation weights ---
             const double a = act[v];
             Msum += y * a;
@@ -423,29 +506,27 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         const double spreadEff = stereoWidthZ_ * sideRatio;
 
         // --- Sub-oscillator injection: mono sub-square one octave below base ---
-        // Fades in when Spread < kSubOnThreshold, over kSubFadeBW.
         if (stereoWidthZ_ <= (kSubOnThreshold + kSubFadeBW)) {
             double t = (kSubOnThreshold - stereoWidthZ_) / kSubFadeBW;
             t = fast_clip(t, 0.0, 1.0); // 0..1 sub mix
 
-            // Generate BLEP-square at fSub = baseHz * 0.5 (50% duty)
             const double fSub  = 0.5 * baseHz;
             const double dtSub = fSub * invSr_;
             double tsub = subPhase_;
 
             // 50% square with BLEP on both edges
             double sqSub = (tsub < 0.5 ? 1.0 : -1.0);
-            sqSub += poly_blep(tsub, dtSub);           // edge at 0
+            sqSub += poly_blep(tsub, dtSub);
             double t2s = tsub - 0.5; if (t2s < 0.0) t2s += 1.0;
-            sqSub -= poly_blep(t2s, dtSub);            // edge at 0.5
+            sqSub -= poly_blep(t2s, dtSub);
 
             // advance sub phase
             double newSub = tsub + dtSub;
             subPhase_ = newSub - std::floor(newSub);
 
             // Add sub into M with simple RMS-style normalization
-            const double g = kSubGain * t;               // effective sub gain (you set 0.90)
-            const double norm = std::sqrt(1.0 + g * g);  // keep perceived loudness steady
+            const double g = kSubGain * t;
+            const double norm = std::sqrt(1.0 + g * g);
             M = (M + g * sqSub) / norm;
         }
 
