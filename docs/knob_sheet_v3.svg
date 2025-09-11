@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1400" viewBox="0 0 1400 1400">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<image x="0" y="0" width="700" height="700" href="knob_morph_v3.svg"/>
+<image x="700" y="0" width="700" height="700" href="knob_timbre_v3.svg"/>
+<image x="0" y="700" width="700" height="700" href="knob_spread_v3.svg"/>
+<image x="700" y="700" width="700" height="700" href="knob_pitch_v3.svg"/>
+</svg>
