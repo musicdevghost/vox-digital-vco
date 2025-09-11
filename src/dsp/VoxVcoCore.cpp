@@ -578,14 +578,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         double M = Msum * invAct;
         double S = Ssum * invAct;
 
-        // --- Envelope follower uses pre-rotation Mid magnitude ---
-        const double follow = follower_.process(std::min(1.0, std::abs(M)));
-
-        // Mix accent and follower, then apply tiny slew for the DAC
-        const double acc   = accent_.process();
-        const double mixed = fast_clip((1.0 - kEnvFollowerMix) * acc + kEnvFollowerMix * follow, 0.0, 1.0);
-        envOut_ = envSlew_.process(mixed);
-
         // Effective spread gates rotation until side voices are active
         const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
         const double spreadEff = stereoWidthZ_ * sideRatio;
@@ -645,6 +637,19 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         // Apply loudness compensation
         Lrot *= comp;
         Rrot *= comp;
+
+        // Envelope follower based on audible (post-rotation) stereo level (RMS).
+        const double acc = accent_.process();
+
+        double lvl = std::sqrt(0.5 * (Lrot * Lrot + Rrot * Rrot));
+        if (!std::isfinite(lvl)) lvl = 0.0;
+
+        // Clamp to [0,1] before following
+        const double follow = follower_.process(std::min(1.0, lvl));
+
+        // Mix accent and follower, then slew for AUX/DAC stability
+        const double mixed = fast_clip((1.0 - kEnvFollowerMix) * acc + kEnvFollowerMix * follow, 0.0, 1.0);
+        envOut_ = envSlew_.process(mixed);
 
         // Normalize and scale
         double yL = Lrot;
