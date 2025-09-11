@@ -1,3 +1,4 @@
+// VoxVcoCore.cpp
 #include "VoxVcoCore.hpp"
 #include <cstring>
 #include <algorithm>
@@ -17,8 +18,8 @@ static inline void eqPowerRotate(double M, double S, double spread01, double& L,
 }
 
 // --- Granular pitch set (intervals in semitones) ---
-static constexpr int kGranNotes[] = { -24, -12, 0, +12, +24 };
-static constexpr int kGranNotesCount = int(sizeof(kGranNotes)/sizeof(kGranNotes[0]));
+static constexpr int kGranNotes[] = { -12, 0, +12 };
+static constexpr int kGranNotesCount = int(sizeof(kGranNotes) / sizeof(kGranNotes[0]));
 
 static inline double pickGranRatio(Lcg& rng) {
     const uint32_t r = rng.next();
@@ -26,6 +27,7 @@ static inline double pickGranRatio(Lcg& rng) {
     const int semis = kGranNotes[idx];
     return std::pow(2.0, semis / 12.0);
 }
+
 
 void VoxVcoCore::init(double sampleRate) {
     sr_ = (sampleRate > 0.0) ? sampleRate : 48000.0;
@@ -51,6 +53,11 @@ void VoxVcoCore::init(double sampleRate) {
     const double tDetune = std::max(0.1, kDetuneSlewMs) * 0.001;
     aWidth_  = std::exp(-1.0 / (sr_ * tWidth));
     aDetune_ = std::exp(-1.0 / (sr_ * tDetune));
+
+    // Loudness-comp smoothing coefficient
+    const double tLoud = std::max(1.0, kLoudCompMs) * 0.001;
+    aLoud_ = std::exp(-1.0 / (sr_ * tLoud));
+    m2Z_ = s2Z_ = 1e-6;
 
 #if defined(TARGET_DAISY)
     limiter_.setup(sr_, 0.75, 0.10, 80.0, 1.0);
@@ -94,6 +101,9 @@ void VoxVcoCore::reset() {
 
     // Sub-osc state
     subPhase_ = 0.0;
+
+    // Loudness-comp smoothing state
+    m2Z_ = s2Z_ = 1e-6;
 
     granularWasOn_ = false;
 }
@@ -472,7 +482,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
                 // Advance grain; re-trigger when done
                 if (++V.grainPos >= N) {
-                    // choose new duration and note
                     const int span = std::max(1, grainMaxS_ - grainMinS_);
                     V.grainTotal = grainMinS_ + int(V.rng.next() % uint32_t(span));
                     if (V.grainTotal < 4) V.grainTotal = 4;
@@ -530,9 +539,36 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             M = (M + g * sqSub) / norm;
         }
 
+        // --- Loudness compensation before width rotation ---
+        // Update smoothed power of M and S (pre-rotation)
+        const double m2 = M * M;
+        const double s2 = S * S;
+        m2Z_ = aLoud_ * m2Z_ + (1.0 - aLoud_) * m2;
+        s2Z_ = aLoud_ * s2Z_ + (1.0 - aLoud_) * s2;
+
+        // Compute rotation coefficients (same as eqPowerRotate)
+        double spread01 = spreadEff;
+        if (spread01 < 0.0) spread01 = 0.0; else if (spread01 > 1.0) spread01 = 1.0;
+        const double theta = spread01 * (0.5 * M_PI);
+        const double c = std::cos(theta);
+        const double s = std::sin(theta);
+
+        // Target total power ~= 2*m2Z_ (what we have at spread=0)
+        // Current power after rotation ~= 2*(c^2*m2Z_ + s^2*s2Z_)
+        // So compensation = sqrt( m2Z_ / (c^2*m2Z_ + s^2*s2Z_) )
+        double denom = c*c*m2Z_ + s*s*s2Z_;
+        if (denom < 1e-12) denom = 1e-12;
+        double comp = std::sqrt(m2Z_ / denom);
+        if (comp < kLoudCompMin) comp = kLoudCompMin;
+        else if (comp > kLoudCompMax) comp = kLoudCompMax;
+
         // Width rotation to stereo (mono at spread=0, adds ±S as spread↑)
         double Lrot = 0.0, Rrot = 0.0;
         eqPowerRotate(M, S, spreadEff, Lrot, Rrot);
+
+        // Apply loudness compensation
+        Lrot *= comp;
+        Rrot *= comp;
 
         // Normalize and scale
         double yL = Lrot;
@@ -545,12 +581,12 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
         // Soft sat
         if (kAnalogModel && kAnalogSoftSatMix > 0.0) {
-            const double m = kAnalogSoftSatMix;
+            const double mSat = kAnalogSoftSatMix;
             auto sat = [&](double v){
                 double x = fast_clip(v / kOutGain, -1.5, 1.5);
-                const double d = 1.0 + 1.5 * m;
+                const double d = 1.0 + 1.5 * mSat;
                 double sh = std::tanh(d * x) / std::tanh(d);
-                return kOutGain * ( (1.0 - m) * x + m * sh );
+                return kOutGain * ( (1.0 - mSat) * x + mSat * sh );
             };
             preL = sat(preL);
             preR = sat(preR);

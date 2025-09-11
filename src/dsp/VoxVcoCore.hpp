@@ -1,3 +1,4 @@
+// VoxVcoCore.hpp
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -110,18 +111,23 @@ private:
     static constexpr double kSpreadSlewMs = 10.0;
     static constexpr double kDetuneSlewMs = 25.0;
 
-    // ---- Sub-oscillator behavior (you set these values) ----
+    // ---- Sub-oscillator behavior (your current values) ----
     static constexpr double kSubOnThreshold = 0.15; // add sub when spread < 0.15
     static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
     static constexpr double kSubGain        = 0.90; // sub level before normalization
 
-    // ---- Granular behavior (new) ----
+    // ---- Granular behavior ----
     static constexpr double kGranularOnThreshold = 0.90; // start granular above this
     static constexpr double kGranularFadeBW      = 0.05; // fade in/out width
-    static constexpr double kGrainMinMs          = 100.0;
-    static constexpr double kGrainMaxMs          = 260.0;
-    static constexpr double kGrainAtkMs          = 12.0;
-    static constexpr double kGrainRelMs          = 12.0;
+    static constexpr double kGrainMinMs          = 70.0;
+    static constexpr double kGrainMaxMs          = 160.0;
+    static constexpr double kGrainAtkMs          = 8.0;
+    static constexpr double kGrainRelMs          = 8.0;
+
+    // ---- Loudness compensation ----
+    static constexpr double kLoudCompMs  = 25.0;  // smoothing window for M/S power
+    static constexpr double kLoudCompMin = 0.85;  // clamp to avoid pumping
+    static constexpr double kLoudCompMax = 1.35;
 
     // ---- State ----
     double sr_ = 48000.0;
@@ -153,7 +159,10 @@ private:
 
     // Sub oscillator state (mono sub square)
     double subPhase_ = 0.0;
-    // (triangle integrator removed from use; kept for potential future)
+
+    // Loudness-comp smoothing
+    double m2Z_ = 1e-6, s2Z_ = 1e-6;
+    double aLoud_ = 0.0;
 
     // ---- Cached params ----
     struct Cached {
