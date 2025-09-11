@@ -1,4 +1,3 @@
-// VoxVcoCore.hpp
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -111,7 +110,7 @@ private:
     static constexpr double kSpreadSlewMs = 10.0;
     static constexpr double kDetuneSlewMs = 25.0;
 
-    // ---- Sub-oscillator behavior (your current values) ----
+    // ---- Sub-oscillator behavior ----
     static constexpr double kSubOnThreshold = 0.15; // add sub when spread < 0.15
     static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
     static constexpr double kSubGain        = 0.90; // sub level before normalization
@@ -124,16 +123,24 @@ private:
     static constexpr double kGrainAtkMs          = 8.0;
     static constexpr double kGrainRelMs          = 8.0;
 
-    // ---- Noisefold (kicks in near Timbre max) ----
-    static constexpr double kNoisefoldStart    = 0.88; // start crossfade
-    static constexpr double kNoisefoldBW       = 0.12; // fade-in width
-    static constexpr double kNoisefoldBaseAmt  = 0.50; // base noise amount
-    static constexpr double kNoisefoldExtraAmt = 1.20; // additional amount * timbre
-
     // ---- Loudness compensation ----
     static constexpr double kLoudCompMs  = 40.0;  // smoothing window for M/S power
     static constexpr double kLoudCompMin = 0.8;  // clamp to avoid pumping
     static constexpr double kLoudCompMax = 1.4;
+
+    // ---- Noisefold (kicks in near Timbre max) ----
+    static constexpr double kNoisefoldStart    = 0.85; // start crossfade
+    static constexpr double kNoisefoldBW       = 0.12; // fade-in width
+    static constexpr double kNoisefoldBaseAmt  = 0.50; // base noise amount
+    static constexpr double kNoisefoldExtraAmt = 1.20; // additional amount * timbre
+
+    // ---- AM/RM via FM jack near Timbre max ----
+    static constexpr double kAmRmStart    = 0.80; // begin AM/RM crossfade
+    static constexpr double kAmRmBW       = 0.20; // covers 0.80..1.00
+    static constexpr double kAmDepthBase  = 0.60; // AM depth at start
+    static constexpr double kAmDepthExtra = 0.40; // extra depth * timbre
+    static constexpr double kRmDepthMax   = 1.00; // ring depth at top
+    static constexpr double kModShape     = 1.75; // soft shaper for mod input
 
     // ---- State ----
     double sr_ = 48000.0;
@@ -176,7 +183,7 @@ private:
         double macroA = 0.0;
         double macroB = 0.0;
         double macroC = 0.0; // Spread 0..1
-        double macroD = 0.0;
+        double macroD = 0.0; // Timbre/FM 0..1
         bool   fmCable = false;
     } P_;
 

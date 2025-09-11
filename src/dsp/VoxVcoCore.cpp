@@ -1,4 +1,3 @@
-// VoxVcoCore.cpp
 #include "VoxVcoCore.hpp"
 #include <cstring>
 #include <algorithm>
@@ -313,6 +312,13 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     stereoWidthZ_       = aWidth_  * stereoWidthZ_       + (1.0 - aWidth_)  * stereoWidth_;
     detuneSpreadCentsZ_ = aDetune_ * detuneSpreadCentsZ_ + (1.0 - aDetune_) * detuneSpreadCents_;
 
+    // AM/RM mix amount driven by Timbre (P_.macroD)
+    double amrmMix = 0.0;
+    {
+        const double t = (P_.macroD - kAmRmStart) / kAmRmBW;
+        amrmMix = sstep(fast_clip(t, 0.0, 1.0)); // 0..1 near the top
+    }
+
     // Activations (smooth unison on/off)
     double act[kMaxUnison];
     computeVoiceActivations_(stereoWidthZ_, act);
@@ -417,13 +423,15 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                 f += f * (jitRel * j) + (jitAbs * j);
             }
 
-            // External FM
+            // External FM (fade out as AM/RM fades in)
             if (fmEnabled_) {
                 const double norm = fast_clip(fmSample / 5.0, -1.0, 1.0);
                 const double absHz = kFmMaxHz * fmIndex_;
                 const double relHz = baseHz * (1.5 * fmIndex_);
                 const double devHz = absHz * 0.7 + relHz * 0.3;
-                f += devHz * norm;
+
+                const double fmFade = 1.0 - amrmMix; // 1→0 as Timbre approaches top
+                f += devHz * norm * fmFade;
             }
 
             f = fast_clip(f, -kMaxHz, kMaxHz);
@@ -505,6 +513,35 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                     if (V.grainTotal < 4) V.grainTotal = 4;
                     V.grainPos = 0;
                     V.grainPitchRatio = pickGranRatio(V.rng);
+                }
+            }
+
+            // --- AM/RM repurpose near Timbre max (uses FM jack as modulator) ---
+            if (fmEnabled_ && amrmMix > 0.0) {
+                double mod = fast_clip(fmSample / 5.0, -1.0, 1.0);
+                // Gentle shaper to keep it musical in [-1,1]
+                mod = std::tanh(kModShape * mod) / std::tanh(kModShape);
+
+                // Split the amrmMix window: first half AM, second half RM
+                const double alpha = amrmMix;                // 0..1
+                const double seg   = alpha * 2.0;            // 0..2
+                const double amX   = fast_clip(seg, 0.0, 1.0);        // 0..1 first half
+                const double rmX   = fast_clip(seg - 1.0, 0.0, 1.0);  // 0..1 second half
+
+                // AM path: y * (1 + depth * mod)
+                const double amDepth = fast_clip(kAmDepthBase + kAmDepthExtra * P_.macroD, 0.0, 1.0);
+                const double yAM = y * (1.0 + amDepth * mod);
+
+                // RM path: y * (depth * mod)
+                const double rmDepth = kRmDepthMax * alpha; // grows toward the top
+                const double yRM = y * (rmDepth * mod);
+
+                // First fade from dry -> AM, then AM -> RM
+                if (amX > 0.0) {
+                    y = morphMix(y, yAM, amX);
+                }
+                if (rmX > 0.0) {
+                    y = morphMix(y, yRM, rmX);
                 }
             }
 
