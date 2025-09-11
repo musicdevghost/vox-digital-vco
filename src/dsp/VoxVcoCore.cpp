@@ -1,3 +1,4 @@
+// VoxVcoCore.cpp
 #include "VoxVcoCore.hpp"
 #include <cstring>
 #include <algorithm>
@@ -69,6 +70,10 @@ void VoxVcoCore::reset() {
     detuneSpreadCentsZ_ = 0.0;
     humPhi50_ = 0.0;
     humPhi60_ = 0.0;
+
+    // Sub-osc state
+    subPhase_ = 0.0;
+    subTriI_  = 0.0;
 }
 
 // Params mapping (unchanged)
@@ -310,6 +315,17 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             prevSync = s;
         }
 
+        // Sub-oscillator follows sync
+        if (hardSync) {
+            subPhase_ = 0.0;
+            subTriI_ *= 0.5;
+        } else if (softSync) {
+            const double k = 0.20;
+            subPhase_ -= k * subPhase_;
+            if (subPhase_ < 0.0) subPhase_ += 1.0;
+            else if (subPhase_ >= 1.0) subPhase_ -= 1.0;
+        }
+
         double fmSample = 0.0;
         if (fmEnabled_ && inR) {
             fmSample = fmHp_.process(double(inR[i]));
@@ -406,6 +422,39 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
         const double spreadEff = stereoWidthZ_ * sideRatio;
 
+        // --- Sub-oscillator injection: mono sub-triangle one octave below base ---
+        // Fades in when Spread < kSubOnThreshold, over kSubFadeBW.
+        if (stereoWidthZ_ <= (kSubOnThreshold + kSubFadeBW)) {
+            double t = (kSubOnThreshold - stereoWidthZ_) / kSubFadeBW;
+            t = fast_clip(t, 0.0, 1.0); // 0..1 sub mix
+
+            // Generate BLEP-triangle at fSub = baseHz * 0.5
+            const double fSub  = 0.5 * baseHz;
+            const double dtSub = fSub * invSr_;
+            double tsub = subPhase_;
+
+            // 50% square with BLEP
+            double sq50 = (tsub < 0.5 ? 1.0 : -1.0);
+            sq50 += poly_blep(tsub, dtSub);
+            double t2s = tsub - 0.5; if (t2s < 0.0) t2s += 1.0;
+            sq50 -= poly_blep(t2s, dtSub);
+
+            // integrate to triangle
+            subTriI_ += (4.0 * dtSub) * sq50;
+            if (subTriI_ > 1.2) subTriI_ = 1.2;
+            else if (subTriI_ < -1.2) subTriI_ = -1.2;
+            const double triSub = subTriI_;
+
+            // advance phase
+            double newSub = tsub + dtSub;
+            subPhase_ = newSub - std::floor(newSub);
+
+            // Add sub into M with simple RMS-style normalization
+            const double g = kSubGain * t;              // effective sub gain
+            const double norm = std::sqrt(1.0 + g * g); // keep perceived loudness steady
+            M = (M + g * triSub) / norm;
+        }
+
         // Width rotation to stereo (mono at spread=0, adds ±S as spread↑)
         double Lrot = 0.0, Rrot = 0.0;
         eqPowerRotate(M, S, spreadEff, Lrot, Rrot);
@@ -450,8 +499,6 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                + kHum60_Level * hum60
                                + kHum2H_Level * std::sin(2.0 * humPhi60_);
 
-            const double dPhi50 = 2.0 * M_PI * 50.0 * invSr_;
-            const double dPhi60 = 2.0 * M_PI * 60.0 * invSr_;
             humPhi50_ += dPhi50; if (humPhi50_ > 2.0 * M_PI) humPhi50_ -= 2.0 * M_PI;
             humPhi60_ += dPhi60; if (humPhi60_ > 2.0 * M_PI) humPhi60_ -= 2.0 * M_PI;
 

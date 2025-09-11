@@ -1,3 +1,4 @@
+// VoxVcoCore.hpp
 #pragma once
 #include <cmath>
 #include <cstdint>
@@ -110,6 +111,11 @@ private:
     static constexpr double kSpreadSlewMs = 10.0;
     static constexpr double kDetuneSlewMs = 25.0;
 
+    // ---- Sub-oscillator behavior ----
+    static constexpr double kSubOnThreshold = 0.15; // add sub when spread < 0.15
+    static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
+    static constexpr double kSubGain        = 0.90; // sub level before normalization
+
     // ---- State ----
     double sr_ = 48000.0;
     double invSr_ = 1.0 / 48000.0;
@@ -133,6 +139,10 @@ private:
     Lcg rng_;
     float prevSync_ = 0.0f;
     OnePoleHP fmHp_;
+
+    // Sub oscillator state (mono sub triangle)
+    double subPhase_ = 0.0;
+    double subTriI_  = 0.0;
 
     // ---- Cached params ----
     struct Cached {
