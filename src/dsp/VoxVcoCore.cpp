@@ -459,6 +459,24 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
                                   V.shapeSkew, V.pwmBias + pwmBiasHF);
             if (!std::isfinite(y)) y = 0.0;
 
+            // --- Noisefold (crossfades in near Timbre max) ---
+            double nfMix = 0.0;
+            if (P_.macroD >= (kNoisefoldStart - kNoisefoldBW)) {
+                const double t = (P_.macroD - kNoisefoldStart) / kNoisefoldBW;
+                nfMix = sstep(fast_clip(t, 0.0, 1.0)); // 0..1 crossfade
+            }
+            if (nfMix > 0.0) {
+                // Light band-limit via 2-tap triangle noise
+                const double n = 0.5 * (V.rng.bipolar() + V.rng.bipolar());
+                const double depth = kNoisefoldBaseAmt + kNoisefoldExtraAmt * P_.macroD;
+
+                // Fold a noisy version of the current voice signal
+                const double folded = fold_reflect(y + depth * n);
+
+                // Equal-power mix from clean -> noisefold as nfMix goes 0..1
+                y = morphMix(y, folded, nfMix);
+            }
+
             // Granular amplitude window (attack/release) blended by granMix
             if (granMix > 0.0) {
                 int N = std::max(4, V.grainTotal);

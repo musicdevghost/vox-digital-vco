@@ -124,6 +124,12 @@ private:
     static constexpr double kGrainAtkMs          = 8.0;
     static constexpr double kGrainRelMs          = 8.0;
 
+    // ---- Noisefold (kicks in near Timbre max) ----
+    static constexpr double kNoisefoldStart    = 0.88; // start crossfade
+    static constexpr double kNoisefoldBW       = 0.12; // fade-in width
+    static constexpr double kNoisefoldBaseAmt  = 0.50; // base noise amount
+    static constexpr double kNoisefoldExtraAmt = 1.20; // additional amount * timbre
+
     // ---- Loudness compensation ----
     static constexpr double kLoudCompMs  = 40.0;  // smoothing window for M/S power
     static constexpr double kLoudCompMin = 0.8;  // clamp to avoid pumping
