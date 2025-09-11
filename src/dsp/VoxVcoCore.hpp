@@ -125,9 +125,9 @@ private:
     static constexpr double kGrainRelMs          = 8.0;
 
     // ---- Loudness compensation ----
-    static constexpr double kLoudCompMs  = 25.0;  // smoothing window for M/S power
-    static constexpr double kLoudCompMin = 0.85;  // clamp to avoid pumping
-    static constexpr double kLoudCompMax = 1.35;
+    static constexpr double kLoudCompMs  = 40.0;  // smoothing window for M/S power
+    static constexpr double kLoudCompMin = 0.8;  // clamp to avoid pumping
+    static constexpr double kLoudCompMax = 1.4;
 
     // ---- State ----
     double sr_ = 48000.0;
