@@ -73,6 +73,9 @@ public:
     void processBlock(const float* inL, const float* inR,
                       float* outL, float* outR, int n) override;
 
+    // Normalized 0..1 envelope for DAC (hardware can scale to volts)
+    inline double auxEnvOut() const { return envOut_; }
+
 private:
     // ---- Constants ----
     static constexpr int    kMaxUnison = 7;
@@ -116,8 +119,8 @@ private:
     static constexpr double kSubGain        = 0.90; // sub level before normalization
 
     // ---- Granular behavior ----
-    static constexpr double kGranularOnThreshold = 0.90; // start granular above this
-    static constexpr double kGranularFadeBW      = 0.05; // fade in/out width
+    static constexpr double kGranularOnThreshold = 0.80; // start granular above this
+    static constexpr double kGranularFadeBW      = 0.025; // fade in/out width
     static constexpr double kGrainMinMs          = 70.0;
     static constexpr double kGrainMaxMs          = 160.0;
     static constexpr double kGrainAtkMs          = 8.0;
@@ -141,6 +144,18 @@ private:
     static constexpr double kAmDepthExtra = 0.40; // extra depth * timbre
     static constexpr double kRmDepthMax   = 1.00; // ring depth at top
     static constexpr double kModShape     = 1.75; // soft shaper for mod input
+
+    // ---- Accent + Follower (Aux env to DAC) ----
+    static constexpr double kAccentAtkMs     = 2.0;
+    static constexpr double kAccentDecMs     = 120.0;
+    static constexpr double kAccentHardAmt   = 1.00;
+    static constexpr double kAccentSoftAmt   = 0.60;
+
+    static constexpr double kFollowAtkMs     = 8.0;
+    static constexpr double kFollowRelMs     = 120.0;
+
+    static constexpr double kEnvFollowerMix  = 0.45; // mix follower vs accent
+    static constexpr double kEnvSlewMs       = 3.0;  // final env smoothing to DAC
 
     // ---- State ----
     double sr_ = 48000.0;
@@ -206,6 +221,74 @@ private:
     // Granular runtime helpers
     bool granularWasOn_ = false;
     int  grainMinS_ = 64, grainMaxS_ = 128, grainAtkS_ = 24, grainRelS_ = 24;
+
+    // ---- Accent Env + Follower internal modules ----
+    struct EnvAD {
+        double aAtk = 0.0, aDec = 0.0;
+        double y = 0.0;
+        double peak = 1.0;
+        enum Phase { IDLE, ATTACK, DECAY } ph = IDLE;
+
+        void setup(double sr, double atk_ms, double dec_ms) {
+            aAtk = std::exp(-1.0 / (sr * (atk_ms * 0.001)));
+            aDec = std::exp(-1.0 / (sr * (dec_ms * 0.001)));
+            y = 0.0; ph = IDLE; peak = 1.0;
+        }
+        inline void trigger(double amt = 1.0) {
+            peak = fast_clip(amt, 0.0, 1.0);
+            ph = ATTACK;
+        }
+        inline double process() {
+            if (ph == ATTACK) {
+                y = aAtk * y + (1.0 - aAtk) * peak;
+                if (y > 0.99 * peak) ph = DECAY;
+            } else if (ph == DECAY) {
+                y = aDec * y; // decay toward 0
+                if (y < 1e-4) { y = 0.0; ph = IDLE; }
+            }
+            if (!std::isfinite(y)) y = 0.0;
+            return y;
+        }
+    } accent_;
+
+    struct EnvFollower {
+        double aAtk = 0.0, aRel = 0.0;
+        double y = 0.0;
+        void setup(double sr, double atk_ms, double rel_ms) {
+            aAtk = std::exp(-1.0 / (sr * (atk_ms * 0.001)));
+            aRel = std::exp(-1.0 / (sr * (rel_ms * 0.001)));
+            y = 0.0;
+        }
+        inline double process(double xAbs) {
+            if (!std::isfinite(xAbs)) xAbs = 0.0;
+            const bool rising = (xAbs > y);
+            const double a = rising ? aAtk : aRel;
+            y = a * y + (1.0 - a) * xAbs;
+            if (!std::isfinite(y)) y = 0.0;
+            return y;
+        }
+    } follower_;
+
+    // Final small slew for envOut_ so DAC moves cleanly
+    struct EnvSlew {
+        double step = 1.0;
+        double y = 0.0;
+        void setup(double sr, double ms) {
+            const double v_per_ms = 1.0 / std::max(1e-9, ms);
+            step = (v_per_ms * 1000.0) / sr;
+            y = 0.0;
+        }
+        inline double process(double x) {
+            x = fast_clip(x, 0.0, 1.0);
+            double d = x - y;
+            if (d > step) d = step;
+            else if (d < -step) d = -step;
+            y += d;
+            return fast_clip(y, 0.0, 1.0);
+        }
+    } envSlew_;
+
+    double envOut_ = 0.0; // 0..1 (for DAC)
 
     // ---- Stereo look-ahead limiter (safe) ----
     struct LookaheadLimiter {

@@ -76,6 +76,12 @@ void VoxVcoCore::init(double sampleRate) {
     grainAtkS_ = std::max(1, int(std::lround(sr_ * (kGrainAtkMs * 0.001))));
     grainRelS_ = std::max(1, int(std::lround(sr_ * (kGrainRelMs * 0.001))));
 
+    // ---- Accent Env + Follower (for DAC) ----
+    accent_.setup(sr_, kAccentAtkMs, kAccentDecMs);
+    follower_.setup(sr_, kFollowAtkMs, kFollowRelMs);
+    envSlew_.setup(sr_, kEnvSlewMs);
+    envOut_ = 0.0;
+
     reset();
 }
 
@@ -103,6 +109,9 @@ void VoxVcoCore::reset() {
 
     // Loudness-comp smoothing state
     m2Z_ = s2Z_ = 1e-6;
+
+    // Env outs
+    envOut_ = 0.0;
 
     granularWasOn_ = false;
 }
@@ -353,6 +362,10 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
             prevSync = s;
         }
 
+        // Fire accent envelope on sync (hard stronger than soft)
+        if (hardSync)      accent_.trigger(kAccentHardAmt);
+        else if (softSync) accent_.trigger(kAccentSoftAmt);
+
         // Sub-oscillator follows sync
         if (hardSync) {
             subPhase_ = 0.0;
@@ -564,6 +577,14 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         const double invAct = (actSum > 1e-9) ? (1.0 / actSum) : 0.0;
         double M = Msum * invAct;
         double S = Ssum * invAct;
+
+        // --- Envelope follower uses pre-rotation Mid magnitude ---
+        const double follow = follower_.process(std::min(1.0, std::abs(M)));
+
+        // Mix accent and follower, then apply tiny slew for the DAC
+        const double acc   = accent_.process();
+        const double mixed = fast_clip((1.0 - kEnvFollowerMix) * acc + kEnvFollowerMix * follow, 0.0, 1.0);
+        envOut_ = envSlew_.process(mixed);
 
         // Effective spread gates rotation until side voices are active
         const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
