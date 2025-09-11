@@ -422,37 +422,31 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
         const double spreadEff = stereoWidthZ_ * sideRatio;
 
-        // --- Sub-oscillator injection: mono sub-triangle one octave below base ---
+        // --- Sub-oscillator injection: mono sub-square one octave below base ---
         // Fades in when Spread < kSubOnThreshold, over kSubFadeBW.
         if (stereoWidthZ_ <= (kSubOnThreshold + kSubFadeBW)) {
             double t = (kSubOnThreshold - stereoWidthZ_) / kSubFadeBW;
             t = fast_clip(t, 0.0, 1.0); // 0..1 sub mix
 
-            // Generate BLEP-triangle at fSub = baseHz * 0.5
+            // Generate BLEP-square at fSub = baseHz * 0.5 (50% duty)
             const double fSub  = 0.5 * baseHz;
             const double dtSub = fSub * invSr_;
             double tsub = subPhase_;
 
-            // 50% square with BLEP
-            double sq50 = (tsub < 0.5 ? 1.0 : -1.0);
-            sq50 += poly_blep(tsub, dtSub);
+            // 50% square with BLEP on both edges
+            double sqSub = (tsub < 0.5 ? 1.0 : -1.0);
+            sqSub += poly_blep(tsub, dtSub);           // edge at 0
             double t2s = tsub - 0.5; if (t2s < 0.0) t2s += 1.0;
-            sq50 -= poly_blep(t2s, dtSub);
+            sqSub -= poly_blep(t2s, dtSub);            // edge at 0.5
 
-            // integrate to triangle
-            subTriI_ += (4.0 * dtSub) * sq50;
-            if (subTriI_ > 1.2) subTriI_ = 1.2;
-            else if (subTriI_ < -1.2) subTriI_ = -1.2;
-            const double triSub = subTriI_;
-
-            // advance phase
+            // advance sub phase
             double newSub = tsub + dtSub;
             subPhase_ = newSub - std::floor(newSub);
 
             // Add sub into M with simple RMS-style normalization
-            const double g = kSubGain * t;              // effective sub gain
-            const double norm = std::sqrt(1.0 + g * g); // keep perceived loudness steady
-            M = (M + g * triSub) / norm;
+            const double g = kSubGain * t;               // effective sub gain (you set 0.90)
+            const double norm = std::sqrt(1.0 + g * g);  // keep perceived loudness steady
+            M = (M + g * sqSub) / norm;
         }
 
         // Width rotation to stereo (mono at spread=0, adds ±S as spread↑)

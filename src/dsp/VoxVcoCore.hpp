@@ -112,9 +112,9 @@ private:
     static constexpr double kDetuneSlewMs = 25.0;
 
     // ---- Sub-oscillator behavior ----
-    static constexpr double kSubOnThreshold = 0.15; // add sub when spread < 0.15
-    static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
-    static constexpr double kSubGain        = 0.90; // sub level before normalization
+    static constexpr double kSubOnThreshold = 0.10; // add sub when spread < 0.15
+    static constexpr double kSubFadeBW      = 0.05; // smooth fade up to threshold
+    static constexpr double kSubGain        = 0.40; // sub level before normalization
 
     // ---- State ----
     double sr_ = 48000.0;
