@@ -320,7 +320,7 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
     fmEnabled_ = P_.fmCable || fmCableInfer;
 
     // Base frequency from V/Oct + MacroA semitone offset
-    const double semis = P_.macroA * 12.0; // ±12
+    const double semis = P_.macroA * (12.0 * kPitchMacroOctaves); // ±(12*kPitchMacroOctaves)
     const double baseHz = fast_clip(kC4 * std::pow(2.0, P_.pitchVolts + semis / 12.0), kMinHz, kMaxHz);
 
     // Smoothed width & detune targets

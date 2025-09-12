@@ -93,6 +93,11 @@ private:
     static constexpr double kOutGain = 5.0;        // Rack ±5 V
 #endif
 
+    // --- Pitch knob range config ---
+    // How many octaves the front-panel PITCH macro covers (symmetric up/down).
+    // 1.0 = ±12 semitones, 2.0 = ±24 semitones, etc.
+    static constexpr double kPitchMacroOctaves = 2.0;  // try ±2 octaves first
+
     // ---- Analog vibe tunables ----
     static constexpr bool   kAnalogModel     = true;
     static constexpr double kAnalogJitterRelPpm = 200.0;
