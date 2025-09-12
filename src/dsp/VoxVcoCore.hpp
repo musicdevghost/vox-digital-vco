@@ -116,12 +116,15 @@ private:
     static constexpr double kDetuneSlewMs = 25.0;
 
     // ---- Sub-oscillator behavior ----
-    static constexpr double kSubOnThreshold = 0.05; // add sub when spread < 0.15
+    static constexpr double kSubOnThreshold = 0.05; // add sub when spread < 0.08
     static constexpr double kSubFadeBW      = 0.25; // smooth fade up to threshold
     static constexpr double kSubGain        = 0.90; // sub level before normalization
 
+    // Spread knob 'dead-zone' start point (0..1). Below this, stereo = 0.
+    static constexpr double kSpreadStartAt = 0.20;  // adjust to taste
+
     // ---- Granular behavior ----
-    static constexpr double kGranularOnThreshold = 0.80; // start granular above this
+    static constexpr double kGranularOnThreshold = 0.85; // start granular above this
     static constexpr double kGranularFadeBW      = 0.025; // fade in/out width
     static constexpr double kGrainMinMs          = 70.0;
     static constexpr double kGrainMaxMs          = 160.0;

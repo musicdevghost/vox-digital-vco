@@ -116,7 +116,7 @@ void VoxVcoCore::reset() {
     granularWasOn_ = false;
 }
 
-// Params mapping (unchanged)
+// Params mapping (unchanged except Spread remap)
 void VoxVcoCore::setParams(const IDspCore::Params& p) {
     P_.pitchVolts = p.pitchVolts;
 
@@ -137,10 +137,19 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
 
     P_.macroA = mA * 2.0 - 1.0;   // ±12 semis
     P_.macroB = mB_norm;          // morph 0..1
-    P_.macroC = mC;               // spread 0..1
+    P_.macroC = mC;               // raw spread 0..1 (kept for menu logic/unison mapping)
     P_.macroD = mD;               // timbre/FM 0..1
 
+    // Unison count still tied to raw knob position
     updateUnisonFromMacro(P_.macroC);
+
+    // ---- Spread: dead-zone + smooth ramp after kSpreadStartAt ----
+    double w = (mC <= kSpreadStartAt) ? 0.0 : (mC - kSpreadStartAt) / (1.0 - kSpreadStartAt);
+    w = w * w * (3.0 - 2.0 * w);         // smoothstep
+    stereoWidth_       = w;
+    detuneSpreadCents_ = 30.0 * w;
+
+    // Other macro-driven params
     P_.fmCable = p.fmCablePresent;
     fmEnabled_ = P_.fmCable;
 
@@ -148,9 +157,6 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     foldAmt_  = P_.macroD;
     chaosAmt_ = P_.macroD;
     fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0));
-
-    stereoWidth_       = P_.macroC;          // targets
-    detuneSpreadCents_ = 30.0 * P_.macroC;
 }
 
 void VoxVcoCore::updateUnisonFromMacro(double mc) {
@@ -582,29 +588,73 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
         const double sideRatio = (actSum > 1e-9) ? (sideActSum / actSum) : 0.0;
         const double spreadEff = stereoWidthZ_ * sideRatio;
 
-        // --- Sub-oscillator injection: mono sub-square one octave below base ---
+        // --- Sub-oscillator injection: mono sub one octave below base, shape = inverse of MORPH ---
         if (stereoWidthZ_ <= (kSubOnThreshold + kSubFadeBW)) {
+            // Crossfade in/out the sub as before (t = 0..1)
             double t = (kSubOnThreshold - stereoWidthZ_) / kSubFadeBW;
-            t = fast_clip(t, 0.0, 1.0); // 0..1 sub mix
+            t = fast_clip(t, 0.0, 1.0);
 
+            // Sub frequency and phase (still follows hard/soft sync above)
             const double fSub  = 0.5 * baseHz;
             const double dtSub = fSub * invSr_;
             double tsub = subPhase_;
 
-            // 50% square with BLEP on both edges
+            // --- Sub primitives (bandlimited where it matters) ---
+            // Saw (polyBLEP)
+            double sawSub = 2.0 * tsub - 1.0;
+            sawSub -= poly_blep(tsub, dtSub);
+
+            // 50% square (BLEP both edges) — solid low-end anchor
             double sqSub = (tsub < 0.5 ? 1.0 : -1.0);
             sqSub += poly_blep(tsub, dtSub);
             double t2s = tsub - 0.5; if (t2s < 0.0) t2s += 1.0;
             sqSub -= poly_blep(t2s, dtSub);
 
-            // advance sub phase
+            // Sine (phase-aligned like the main path)
+            double tSinSub = tsub - 0.25; if (tSinSub < 0.0) tSinSub += 1.0;
+            const double sineSub = std::sin(2.0 * M_PI * tSinSub);
+
+            // Triangle (simple analytic; fine at sub-octave)
+            double triSub = 2.0 * std::abs(2.0 * tsub - 1.0) - 1.0;
+
+            // --- Map main MORPH (P_.macroB) inversely to sub shape ---
+            // inv = 1 → bright (saw/square) when main morph ≈ sine
+            // inv = 0 → gentle (sine/triangle) when main morph ≈ square
+            double inv = 1.0 - fast_clip(P_.macroB, 0.0, 1.0);
+
+            // Walk a 3-step path: sine→tri→saw→square using inv as position
+            double ySub = 0.0;
+            {
+                double whole = 0.0;
+                double zf = std::modf(inv * 3.0, &whole);   // 0..1 within each segment
+                int zone = (int)whole; if (zone < 0) zone = 0; if (zone > 2) zone = 2;
+
+                // Equal-power crossfades (same curve as morphMix)
+                auto mixEP = [](double a, double b, double x) {
+                    const double u  = fast_clip(x, 0.0, 1.0);
+                    const double wa = std::cos(0.5 * M_PI * u);
+                    const double wb = std::sin(0.5 * M_PI * u);
+                    double y = a * wa + b * wb;
+                    double n = wa + wb;
+                    return (n > 1e-9) ? (y / n) : y;
+                };
+
+                switch (zone) {
+                    default:
+                    case 0: ySub = mixEP(sineSub, triSub, zf); break;   // 0..1/3
+                    case 1: ySub = mixEP(triSub,  sawSub, zf); break;   // 1/3..2/3
+                    case 2: ySub = mixEP(sawSub,  sqSub,  zf); break;   // 2/3..1
+                }
+            }
+
+            // Advance sub phase (unchanged)
             double newSub = tsub + dtSub;
             subPhase_ = newSub - std::floor(newSub);
 
-            // Add sub into M with simple RMS-style normalization
+            // Mix into mono M with your RMS-style normalization (unchanged)
             const double g = kSubGain * t;
             const double norm = std::sqrt(1.0 + g * g);
-            M = (M + g * sqSub) / norm;
+            M = (M + g * ySub) / norm;
         }
 
         // --- Loudness compensation before width rotation ---
