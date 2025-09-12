@@ -156,7 +156,7 @@ void VoxVcoCore::setParams(const IDspCore::Params& p) {
     pwmWidth_ = 0.05 + 0.90 * P_.macroD;
     foldAmt_  = P_.macroD;
     chaosAmt_ = P_.macroD;
-    fmIndex_  = std::sqrt(fast_clip(P_.macroD, 0.0, 1.0));
+    fmIndex_  = kFmDecoupled ? kFmIndexDefault : std::sqrt(fast_clip(P_.macroD, 0.0, 1.0));
 }
 
 void VoxVcoCore::updateUnisonFromMacro(double mc) {
@@ -444,12 +444,12 @@ void VoxVcoCore::processBlock(const float* inL, const float* inR,
 
             // External FM (fade out as AM/RM fades in)
             if (fmEnabled_) {
-                const double norm = fast_clip(fmSample / 5.0, -1.0, 1.0);
+                const double norm  = fast_clip(fmSample / kFmInputNormVolts, -1.0, 1.0);
                 const double absHz = kFmMaxHz * fmIndex_;
                 const double relHz = baseHz * (1.5 * fmIndex_);
                 const double devHz = absHz * 0.7 + relHz * 0.3;
 
-                const double fmFade = 1.0 - amrmMix; // 1→0 as Timbre approaches top
+                const double fmFade = kFmDecoupled ? kFmKeepAtTop : (1.0 - amrmMix); // keep FM present near top
                 f += devHz * norm * fmFade;
             }
 

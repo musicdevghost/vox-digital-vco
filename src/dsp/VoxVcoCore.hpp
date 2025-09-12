@@ -150,6 +150,12 @@ private:
     static constexpr double kRmDepthMax   = 1.00; // ring depth at top
     static constexpr double kModShape     = 1.75; // soft shaper for mod input
 
+    // ---- External FM depth (decoupled from Timbre) ----
+    static constexpr bool   kFmDecoupled      = true;   // set false to restore legacy behavior
+    static constexpr double kFmIndexDefault   = 1.00;   // 0..1, overall FM depth when decoupled
+    static constexpr double kFmKeepAtTop      = 1.00;   // 1=keep FM fully even when AM/RM active
+    static constexpr double kFmInputNormVolts = 5.0;    // expected ±voltage for full-scale FM
+
     // ---- Accent + Follower (Aux env to DAC) ----
     static constexpr double kAccentAtkMs     = 2.0;
     static constexpr double kAccentDecMs     = 120.0;
@@ -203,7 +209,7 @@ private:
         double macroA = 0.0;
         double macroB = 0.0;
         double macroC = 0.0; // Spread 0..1
-        double macroD = 0.0; // Timbre/FM 0..1
+        double macroD = 0.0; // Timbre 0..1
         bool   fmCable = false;
     } P_;
 
