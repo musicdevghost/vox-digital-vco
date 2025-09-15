@@ -1,150 +1,196 @@
+// Pots unchanged; add MUX2 attenuverters that scale/invert the 4 CVs.
+// Gate is bypassed so you always hear sound.
+
 #include "daisy_seed.h"
-#include "Hw.hpp"
 #include <cmath>
 
-#include "dsp/IDspCore.hpp"
-#include "dsp/SelectedCore.hpp"
-#include "dsp/shared/EnvFollower.hpp"
-
 using namespace daisy;
+using namespace daisy::seed;
 
-static hw::Hw g_hw;
+// ---------- MUX1 (pots): COM=A5, selects D5/D6/D7 ----------
+#define MUX1_COM_PIN  A5
+#define MUX1_SEL0     D5
+#define MUX1_SEL1     D6
+#define MUX1_SEL2     D7
 
-#ifndef VM_SR
-#define VM_SR 48000
-#endif
+// Channel map you confirmed for pots:
+// ch0 = Pitch, ch1 = Morph (volume), ch2 = Spread (fold), ch3 = Tone (wave morph)
+#define CH_PITCH   0
+#define CH_MORPH   1
+#define CH_SPREAD  2
+#define CH_TONE    3
 
-#ifndef VM_BLOCKSIZE
-#define VM_BLOCKSIZE 48
-#endif
+// ---------- MUX2 (attenuverters): COM=A6, selects D1/D2/D3 ----------
+#define MUX2_COM_PIN  A6
+#define MUX2_SEL0     D1  // 4051 A (LSB)
+#define MUX2_SEL1     D2  // 4051 B
+#define MUX2_SEL2     D3  // 4051 C
 
-#ifndef VM_CORE_HAS_INPUTS
-#define VM_CORE_HAS_INPUTS 1
-#endif
+// Attenuverter channel guesses (change if your board maps differently)
+#define AT_CH_FILTER  0   // FILTER_AT  → will scale CV for Wave Morph
+#define AT_CH_SIZE    1   // SIZE_AT    → will scale CV for Pitch
+#define AT_CH_FEEDB   2   // FEEDB_AT   → will scale CV for Volume
+#define AT_CH_DIFF    3   // DIFF_AT    → will scale CV for Fold
 
-#ifndef HW_TEST
-#define HW_TEST 0
-#endif
+// CV polarity (your CV1..CV4 stages are inverting per your schematic)
+static constexpr float CV_POL_PITCH = -1.0f; // A0
+static constexpr float CV_POL_VOL   = -1.0f; // A1
+static constexpr float CV_POL_FOLD  = -1.0f; // A2
+static constexpr float CV_POL_MORPH = -1.0f; // A3
 
-#ifndef VM_CPU_METER
-#define VM_CPU_METER 1
-#endif
+// Pitch CV depth in the 0..1 domain (1.0 → full ±0.5 around the knob)
+static constexpr float CV_PITCH_RANGE = 1.0f;
 
-// ===== Test mode (simple 440Hz, LED blink, DAC ramp) =====
-#if HW_TEST
-static float phs  = 0.f;
-static float dacv = 0.f;
-static int   blink = 0;
+DaisySeed hw;
+// 5 direct CVs + MUX1 + MUX2
+AdcChannelConfig adc_cfg[7];
 
-static void TestAudio(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
+// ---- Direct CVs (A0..A4) ----
+static float cv1_pitch = 0.f;  // A0
+static float cv2_vol   = 0.f;  // A1
+static float cv3_fold  = 0.f;  // A2
+static float cv4_morph = 0.f;  // A3
+static float cv5_gate  = 0.f;  // A4 (ignored/bypassed)
+
+// ---- Pots via MUX1 ----
+static float kPitch  = 0.f;
+static float kMorph  = 0.f; // used as volume
+static float kSpread = 0.f; // fold
+static float kTone   = 0.f; // wave morph
+
+// ---- Attenuverters via MUX2 (0..1 → -1..+1) ----
+static float at_filter = 0.f;
+static float at_size   = 0.f;
+static float at_feedb  = 0.f;
+static float at_diff   = 0.f;
+
+// DSP state
+static float phase = 0.f;
+
+// Helpers
+static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
+static inline float lerp(float a, float b, float t){ return a + t * (b - a); }
+static inline float apply_uni(float cv01, float pol){ return pol >= 0.f ? cv01 : (1.f - cv01); }
+static inline float uni_to_bi(float u){ return (u * 2.f) - 1.f; } // 0..1 -> -1..+1
+
+static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
+static inline float wave_tri(float ph)    { return 1.f - 4.f * fabsf(ph - 0.5f); }
+static inline float wave_saw(float ph)    { return 2.f * ph - 1.f; }
+static inline float wave_square(float ph) { return ph < 0.5f ? 1.f : -1.f; }
+static inline float wave_morph(float ph, float tone01)
 {
-    (void)in;
-    const float sr  = float(VM_SR);
-    const float inc = 440.f / sr;
-
-    for (size_t i = 0; i < n; ++i)
-    {
-        phs += inc;
-        if (phs >= 1.f) phs -= 1.f;
-        const float s = 0.2f * sinf(2.f * 3.14159265f * phs);
-        out[0][i] = s;
-        out[1][i] = s;
-    }
-
-    // Blink ~2 Hz
-    static int count = 0;
-    if (++count > int(sr / n / 2)) { count = 0; blink ^= 1; }
-    g_hw.seed()->SetLed(blink);
-
-    // DAC ramp 0..1
-    dacv += 0.0025f;
-    if (dacv > 1.f) dacv = 0.f;
-    g_hw.writeEnv(dacv);
+    tone01 = clamp01(tone01);
+    float idx = tone01 * 3.f;
+    int   seg = (int)idx;           // 0,1,2
+    float t   = idx - float(seg);   // 0..1
+    if (seg == 0) return lerp(wave_sine(ph),   wave_tri(ph),  t);
+    if (seg == 1) return lerp(wave_tri(ph),    wave_saw(ph),  t);
+    return            lerp(wave_saw(ph),       wave_square(ph), t);
 }
-#endif // HW_TEST
-
-// ===== Production audio callback =====
-namespace {
-vm::SelectedCore core;        // alias set in dsp/SelectedCore.hpp
-vm::EnvFollower  env;         // AR envelope follower
-#if !VM_CORE_HAS_INPUTS
-static float     zeroL[VM_BLOCKSIZE] = {0.f};
-static float     zeroR[VM_BLOCKSIZE] = {0.f};
-#endif
-#if VM_CPU_METER
-constexpr float kBlockMs = (float)VM_BLOCKSIZE * 1000.f / float(VM_SR);
-static float    busySm   = 0.f; // smoothed CPU load
-#endif
-} // anon
+static inline float softFold(float x, float amt)
+{
+    const float drive = 1.f + 9.f * clamp01(amt);
+    return tanhf(drive * x);
+}
 
 static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
 {
-#if VM_CPU_METER
-    const uint32_t us0 = System::GetUs();
-#endif
+    (void)in;
+    const float sr = hw.AudioSampleRate();
 
-    // 1) Advance hardware scanning/mix controls
-    g_hw.poll();
+    // ---- Baseline from pots (unchanged) ----
+    const float basePitch = kPitch;                             // 0..1
+    const float baseVol   = 0.05f + 0.95f * kMorph;             // 0..1
+    const float baseFold  = kSpread;                            // 0..1
+    const float baseMorph = kTone;                              // 0..1
 
-    // 2) Push params to core (using your IDspCore::Params)
-    const auto c = g_hw.controls();
-    vm::IDspCore::Params p;
-    p.pitch       = c.pitch;
-    p.timbre      = c.timbre;
-    p.morph       = c.morph;
-    p.spread      = c.spread;
-    p.pitchVolts  = static_cast<double>(c.pitchVolts);
-    p.macros[0]   = p.macros[1] = p.macros[2] = p.macros[3] = 0.0; // not used here
-    p.fmCablePresent = false; // VoxVcoCore can infer if needed
-    core.setParams(p);
+    // ---- CVs with polarity correction ----
+    const float cvPitchCorr = apply_uni(cv1_pitch, CV_POL_PITCH); // 0..1
+    const float cvVolCorr   = apply_uni(cv2_vol,   CV_POL_VOL);
+    const float cvFoldCorr  = apply_uni(cv3_fold,  CV_POL_FOLD);
+    const float cvMorphCorr = apply_uni(cv4_morph, CV_POL_MORPH);
 
-    // 3) Prepare pointers (support cores without inputs)
-#if VM_CORE_HAS_INPUTS
-    const float* inL = in[0];
-    const float* inR = in[1];
-#else
-    const float* inL = zeroL;
-    const float* inR = zeroR;
-#endif
+    // ---- Attenuverters (bipolar –1..+1) ----
+    const float avPitch  = uni_to_bi(at_size);    // SIZE_AT controls pitch CV
+    const float avVol    = uni_to_bi(at_feedb);   // FEEDB_AT controls volume CV
+    const float avFold   = uni_to_bi(at_diff);    // DIFF_AT controls fold CV
+    const float avMorph  = uni_to_bi(at_filter);  // FILTER_AT controls morph CV
 
-    // 4) Process with your signature
-    core.processBlock(inL, inR, out[0], out[1], static_cast<int>(n));
+    // ---- Apply CVs with attenuverters ----
+    // Pitch: knob + (±)CV depth (continuous, no quantization)
+    const float pitch01 = clamp01(basePitch + CV_PITCH_RANGE * avPitch * (cvPitchCorr - 0.5f));
+    const float freq    = 50.f + pitch01 * 1950.f;
 
-    // 5) Envelope from outputs (8 ms attack / 160 ms release)
-    const float e = env.processBlockRmsStereo(out[0], out[1], n);
-    g_hw.writeEnv(e);
+    // Volume: add CV around the knob (keep 0..1)
+    const float vol     = clamp01(baseVol + avVol  * (cvVolCorr   - 0.5f));
 
-#if VM_CPU_METER
-    // --- CPU meter: light onboard LED when >80% of block time is used
-    const uint32_t us1     = System::GetUs();
-    const float    used_ms = (us1 - us0) / 1000.f;
-    const float    busy    = used_ms / kBlockMs;  // 0..1+
-    const float    a       = 0.2f;                // smoothing
-    busySm += a * (busy - busySm);
-    g_hw.seed()->SetLed(busySm > 0.8f);
-#endif
+    // Fold / Morph: add CV around the knob (keep 0..1)
+    const float foldAmt = clamp01(baseFold  + avFold  * (cvFoldCorr  - 0.5f));
+    const float morph   = clamp01(baseMorph + avMorph * (cvMorphCorr - 0.5f));
+
+    const float inc = freq / sr;
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        phase += inc;
+        if (phase >= 1.f) phase -= 1.f;
+
+        float x = wave_morph(phase, morph);
+        x = softFold(x, foldAmt);
+
+        const float y = vol * x;
+        out[0][i] = y;
+        out[1][i] = y;
+    }
 }
 
 int main(void)
 {
-    const float  sr = float(VM_SR);
-    const size_t bs = size_t(VM_BLOCKSIZE);
+    hw.Configure();
+    hw.Init();
+    hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
+    hw.SetAudioBlockSize(48);
 
-    hw::Tunables t;
-    t.smoothAlpha = -1.f;   // disable legacy alpha
-    t.smoothMs    = 8.0f;   // use time-constant smoothing
-    t.envAtkMs    = 8.0f;
-    t.envRelMs    = 160.0f;
+    // ----- ADC setup -----
+    // Direct CVs
+    adc_cfg[0].InitSingle(A0); // CV1: pitch (inverting front-end)
+    adc_cfg[1].InitSingle(A1); // CV2: volume (inverting)
+    adc_cfg[2].InitSingle(A2); // CV3: fold (inverting)
+    adc_cfg[3].InitSingle(A3); // CV4: morph (inverting)
+    adc_cfg[4].InitSingle(A4); // CV5: gate (ignored here)
 
-    g_hw.init(sr, bs, t);
+    // MUX1 pots
+    adc_cfg[5].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2);
+    // MUX2 attenuverters
+    adc_cfg[6].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2);
 
-#if HW_TEST
-    g_hw.startAudio(TestAudio);
-#else
-    core.init(double(sr));
-    env.setupMs(sr, t.envAtkMs, t.envRelMs);
-    g_hw.startAudio(AudioCb);
-#endif
+    hw.adc.Init(adc_cfg, 7);
+    hw.adc.Start();
 
-    while (1) { System::Delay(100); }
+    hw.StartAudio(AudioCb);
+
+    // Poll all CVs, pots, and attenuverters
+    while (1)
+    {
+        // Direct CVs
+        cv1_pitch = hw.adc.GetFloat(0);
+        cv2_vol   = hw.adc.GetFloat(1);
+        cv3_fold  = hw.adc.GetFloat(2);
+        cv4_morph = hw.adc.GetFloat(3);
+        cv5_gate  = hw.adc.GetFloat(4); // not used in this test
+
+        // MUX1 (pots) on index 5
+        kPitch  = hw.adc.GetMuxFloat(5, CH_PITCH);
+        kMorph  = hw.adc.GetMuxFloat(5, CH_MORPH);
+        kSpread = hw.adc.GetMuxFloat(5, CH_SPREAD);
+        kTone   = hw.adc.GetMuxFloat(5, CH_TONE);
+
+        // MUX2 (attenuverters) on index 6
+        at_filter = hw.adc.GetMuxFloat(6, AT_CH_FILTER);
+        at_size   = hw.adc.GetMuxFloat(6, AT_CH_SIZE);
+        at_feedb  = hw.adc.GetMuxFloat(6, AT_CH_FEEDB);
+        at_diff   = hw.adc.GetMuxFloat(6, AT_CH_DIFF);
+
+        System::Delay(1);
+    }
 }
