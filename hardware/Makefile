@@ -1,61 +1,62 @@
-# Minimal Daisy Seed firmware using shared VCV Rack DSP (C++17 only)
-# Run from inside hardware/:
-#   make         # build
-#   make flash   # DFU (alias to Daisy's program-dfu)
-#   make clean
-#   make size    # section sizes
-#   make verify  # nm + DSP-only heap check (no operator new/delete CALLS in ../src/dsp/*.cpp)
+# VOX — Daisy firmware Makefile (robust)
+# Usage:
+#   make deps          # show resolved LIBDAISY_DIR / DAISYSP_DIR
+#   make               # build
+#   make flash         # DFU flash
+#   make clean         # clean
+#   make size          # show size
 
 TARGET = firmware
 
-# App + your shared DSP sources
-# Include both top-level dsp/*.cpp and dsp/cores/*.cpp (new location for cores)
 CPP_SOURCES = \
   main.cpp \
-  Hw.cpp \
-  $(wildcard ../src/dsp/*.cpp) \
-  $(wildcard ../src/dsp/cores/*.cpp)
+  ../src/dsp/VoxCore.cpp
 
-# Submodules at repo root
-LIBDAISY_DIR = ../libdaisy
-DAISYSP_DIR  = ../DaisySP
+# Allow local overrides without editing this file
+-include Makefile.local
 
-# Use C++17 (override Daisy default)
-CPP_STANDARD = -std=gnu++17
+# Candidate locations (first matching wins)
+CANDIDATE_LIBDAISY_DIRS := \
+  $(abspath ../../libDaisy) \
+  $(abspath ../libDaisy) \
+  $(abspath ../../../libDaisy) \
+  $(LIBDAISY_DIR)
 
-# Include paths
-# -I../src so that SelectedCore.hpp can #include "dsp/VoxVcoCore.hpp"
-# -I../src/dsp so we can include "SelectedCore.hpp" directly
-C_INCLUDES += -I.. -I../src -I../src/dsp -I.
+CANDIDATE_DAISYSP_DIRS := \
+  $(abspath ../../DaisySP) \
+  $(abspath ../DaisySP) \
+  $(abspath ../../../DaisySP) \
+  $(DAISYSP_DIR)
 
-# Extra flags (Daisy core already sets M7 hard-float, linker script, etc.)
-CFLAGS   += -ffunction-sections -fdata-sections -fno-builtin -fno-math-errno -Wno-psabi
-CXXFLAGS += -fno-exceptions -fno-rtti
-LDFLAGS  += -Wl,--gc-sections -Wl,--print-memory-usage
+# Resolve directories
+LIBDAISY_DIR := $(firstword $(foreach d,$(CANDIDATE_LIBDAISY_DIRS),$(if $(wildcard $(d)/core/Makefile),$(d))))
+DAISYSP_DIR  := $(firstword $(foreach d,$(CANDIDATE_DAISYSP_DIRS),$(if $(wildcard $(d)/Makefile),$(d))))
 
-# Build-time defines (override with DEFS_EXTRA=...)
-# Default to your selector alias vm::SelectedCore
-C_DEFS += \
-  -DVM_HARDWARE=1 \
-  -DVM_USE_SHARED_CORE=1 \
-  -DVM_CORE_TYPE='vm::SelectedCore' \
-  -DVM_CORE_PROCESS_NAME=processBlock \
-  -DVM_CORE_HAS_INPUTS=1 \
-  -DVM_SR=48000 -DVM_BLOCKSIZE=48 \
-  -DTARGET_DAISY
-
-# Optional: force-include a header if you ever need to
-# make HEADERS_FORCE=../src/dsp/SelectedCore.hpp
-ifdef HEADERS_FORCE
-CXXFLAGS += -include $(HEADERS_FORCE)
+# Friendly errors if libDaisy is missing
+ifeq ($(LIBDAISY_DIR),)
+$(error Could not find libDaisy. Set LIBDAISY_DIR=/absolute/path/to/libDaisy or run `git submodule update --init --recursive` at the repo root.)
+endif
+ifeq ($(wildcard $(LIBDAISY_DIR)/core/Makefile),)
+$(error $(LIBDAISY_DIR)/core/Makefile not found. Is libDaisy checked out correctly?)
 endif
 
-# Pull in Daisy’s core Makefile (like official examples)
+# Optional DaisySP (only if present)
+ifneq ($(DAISYSP_DIR),)
+C_INCLUDES += -I$(DAISYSP_DIR)/Source
+endif
+
+# Project includes
+C_INCLUDES += -I../src -I../src/dsp
+
+# Flags
+C_DEFS += -DDEBUG -DDAISY_USE_FPU=1
+OPT ?= -O3
+
+# Daisy core rules
 SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
 include $(SYSTEM_FILES_DIR)/Makefile
 
-# Convenience aliases & checks
-.PHONY: flash size verify
+.PHONY: flash size deps
 
 flash: program-dfu
 
@@ -63,27 +64,6 @@ size: $(BUILD_DIR)/$(TARGET).elf
 	$(SIZE) -B $<
 	$(SIZE) -A $<
 
-# DSP object list (for heap-check). Include cores/*.cpp as well.
-DSP_SRCS := $(wildcard ../src/dsp/*.cpp) $(wildcard ../src/dsp/cores/*.cpp)
-DSP_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(patsubst %.cpp,%.o,$(DSP_SRCS))))
-
-# Verify:
-#  1) No unresolved externals after link (nm -u empty).
-#  2) No CALLS or tail-calls to operator new/delete inside your DSP objects.
-#     (We scan only $(DSP_OBJS) with objdump; this avoids false positives from the C++ runtime.)
-verify: $(BUILD_DIR)/$(TARGET).elf
-	@echo "---- unresolved externals (should be empty):"
-	@arm-none-eabi-nm -u -C $< || true
-	@arm-none-eabi-nm -u -C $< | awk 'END{ if (NR>0){ print "*** ERROR: Unresolved externals present."; exit 1 }}'
-	@echo "---- heap check in DSP objects ($(DSP_OBJS)):"
-	@ok=1; \
-	for f in $(DSP_OBJS); do \
-	  if [ -f $$f ]; then \
-	    if arm-none-eabi-objdump -drwC $$f | grep -E '\b(bl|blx)\b.*(_Znwm|_Znwj|_Znay|_Znaj|_ZdlPv|_ZdlPvm|_ZdaPv)\b|\bb\.\w+\b.*(_Znwm|_Znwj|_Znay|_Znaj|_ZdlPv|_ZdlPvm|_ZdaPv)\b' >/dev/null; then \
-	      echo "*** ERROR: heap call in $$f"; \
-	      arm-none-eabi-objdump -drwC $$f | grep -nE '\b(bl|blx|b\.\w+)\b.*(_Znwm|_Znwj|_Znay|_Znaj|_ZdlPv|_ZdlPvm|_ZdaPv)\b' | head -n 20; \
-	      ok=0; \
-	    fi; \
-	  fi; \
-	done; \
-	if [ $$ok -eq 1 ]; then echo "OK (no operator new/delete calls in DSP objects)"; else exit 1; fi
+deps:
+	@echo "LIBDAISY_DIR=$(LIBDAISY_DIR)"
+	@echo "DAISYSP_DIR=$(DAISYSP_DIR)"

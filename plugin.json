@@ -4,13 +4,16 @@
   "license": "proprietary",
   "brand": "Voxmachina",
   "author": "Voxmachina",
-  "name": "Vox Template Pack",
+  "name": "VOX",
   "modules": [
     {
       "slug": "vox-vco",
-      "name": "Vox VCO",
-      "description": "Distinctive oscillator: unison drift, TZFM, BLEP shapes, morph path, stereo spread.",
-      "tags": [ "Oscillator", "Digital", "FM", "Stereo" ]
+      "name": "VOX",
+      "description": "Hardware-first simulator: Phase A square oscillator with pitch.",
+      "tags": [
+        "Oscillator",
+        "Digital"
+      ]
     }
   ]
 }
