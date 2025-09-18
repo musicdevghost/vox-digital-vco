@@ -1,2 +1,2 @@
 #include "VoxCore.hpp"
-// Phase A kept header-only; TU here for build systems
+// TU retained for build systems; main implementation is header-based

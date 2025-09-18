@@ -11,6 +11,7 @@ VoxSimModule::VoxSimModule() {
     configParam(PARAM_MORPH, 0.f, 1.f, 0.0f, "Morph");
     configParam(PARAM_SPREAD, 0.f, 1.f, 1.0f, "Spread (amp)");
     configParam(PARAM_TIMBRE, 0.f, 1.f, 0.5f, "Timbre (PWM)");
+
     configParam(PARAM_ATT_PITCH, -1.f, 1.f, 0.0f, "Atten Pitch");
     configParam(PARAM_ATT_MORPH, -1.f, 1.f, 0.0f, "Atten Morph");
     configParam(PARAM_ATT_SPREAD, -1.f, 1.f, 0.0f, "Atten Spread");
@@ -37,7 +38,7 @@ void VoxSimModule::process(const ProcessArgs& args) {
     if (frameIndex_ >= kBlock) {
         frameIndex_ = 0;
 
-        // Sample controls once per Daisy "tick"
+        // Sample controls "once per hardware tick"
         hal_.knobPitch01  = params[PARAM_PITCH].getValue();
         hal_.knobMorph01  = params[PARAM_MORPH].getValue();
         hal_.knobTimbre01 = params[PARAM_TIMBRE].getValue();
@@ -58,6 +59,7 @@ void VoxSimModule::process(const ProcessArgs& args) {
 
         core_.processBlock(coreParams_, controls, mods, state_, outL_, outR_, kBlock);
     }
+
     outputs[OUTPUT_OUT_L].setVoltage(5.f * outL_[frameIndex_]);
     outputs[OUTPUT_OUT_R].setVoltage(5.f * outR_[frameIndex_]);
     frameIndex_++;

@@ -2,7 +2,15 @@
 #include <cmath>
 #include <cstdint>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace vm { namespace vox {
+
+static inline double clamp01(double x) {
+    return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
+}
 
 struct CoreParams {
     double sampleRate = 48000.0;
@@ -12,10 +20,13 @@ struct CoreParams {
 
 struct Controls {
     double pitchKnob01 = 0.5; // 0..1
+    double morph01     = 0.0; // 0=square, 1=sine
+    double timbre01    = 0.5; // PWM depth center
+    double spread01    = 1.0; // amplitude scalar
 };
 
 struct Mods {
-    // reserved for Phase B (v/oct, fm, sync...)
+    // reserved for Phase C (v/oct, fm, sync...)
 };
 
 struct State {
@@ -40,21 +51,41 @@ public:
         const double freq = hzFromSemis(knobSemis, params_.baseA4);
         const double dt = 1.0 / params_.sampleRate;
 
+        const double morph = clamp01(k.morph01);
+        const double pwmDepth = clamp01(k.timbre01);
+        const double amp = clamp01(k.spread01);
+
+        // Map timbre to duty with safe clamp (5%..95%).
+        const double duty = 0.5 + (pwmDepth - 0.5) * 0.9; // +/-45% around 50%
+        const double dutySafe = clampDuty(duty);
+
         for (int i = 0; i < nframes; ++i) {
             s.phase += freq * dt;
             if (s.phase >= 1.0) s.phase -= std::floor(s.phase);
-            const float y = (s.phase < 0.5) ? 1.0f : -1.0f;
-            outL[i] = y;
-            outR[i] = y;
+
+            // PWM square
+            double pulse = (s.phase < dutySafe) ? 1.0 : -1.0;
+            // Sine
+            double sine = std::sin(2.0 * M_PI * s.phase);
+            // Morph
+            double y = (1.0 - morph) * pulse + morph * sine;
+            // Spread as amplitude
+            y *= amp;
+
+            outL[i] = static_cast<float>(y);
+            outR[i] = static_cast<float>(y);
         }
     }
 
 private:
-    static inline double clamp01(double x) {
-        return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
-    }
     static inline double hzFromSemis(double semis, double f0) {
         return f0 * std::pow(2.0, semis / 12.0);
+    }
+    static inline double clampDuty(double d) {
+        const double lo = 0.05, hi = 0.95;
+        if (d < lo) return lo;
+        if (d > hi) return hi;
+        return d;
     }
 
     CoreParams params_;

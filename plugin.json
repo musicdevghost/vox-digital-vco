@@ -9,7 +9,7 @@
     {
       "slug": "vox-vco",
       "name": "VOX",
-      "description": "Hardware-first simulator: Phase A square oscillator with pitch.",
+      "description": "Hardware-first simulator: Phase B (Pitch, Morph, Timbre/PWM, Spread).",
       "tags": [
         "Oscillator",
         "Digital"
