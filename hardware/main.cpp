@@ -1,4 +1,4 @@
-// VOX — Hardware main.cpp (Shared core, audio-rate FM/HSYNC/SSYNC, interleaved fix)
+// VOX — Hardware main.cpp (Shared core, audio-rate FM/HSYNC/SSYNC, interleaved per-frame sampling)
 #include "daisy_seed.h"
 #include <cmath>
 #include "../src/dsp/VoxCore.hpp"
@@ -9,7 +9,6 @@ using namespace daisy::seed;
 using namespace vm::vox;
 using namespace vm::vox::glue;
 
-// ---- MUX config (your mapping) ----
 #define MUX1_COM_PIN  A5
 #define MUX1_SEL0     D5
 #define MUX1_SEL1     D6
@@ -28,14 +27,12 @@ using namespace vm::vox::glue;
 #define AT_CH_SPREAD 2
 #define AT_CH_MORPH  3
 
-// ---- Presence detection thresholds (file-scope so lambda can see them) ----
 static constexpr float HSYNC_ENV_ATTACK  = 0.01f;
 static constexpr float HSYNC_ENV_RELEASE = 0.001f;
-static constexpr float HSYNC_ENV_THRESH  = 0.02f;  // ~ -34 dBFS
-
+static constexpr float HSYNC_ENV_THRESH  = 0.02f;
 static constexpr float FM_ENV_ATTACK     = 0.01f;
 static constexpr float FM_ENV_RELEASE    = 0.001f;
-static constexpr float FM_ENV_THRESH     = 0.02f;  // ~ -34 dBFS
+static constexpr float FM_ENV_THRESH     = 0.02f;
 
 static DaisySeed hw;
 static AdcChannelConfig adc_cfg[7];
@@ -47,18 +44,16 @@ int main(void)
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     hw.SetAudioBlockSize(48);
 
-    // ADC: direct CVs A0..A3 (invert), A4 soft sync gate, MUX for pots/attenuverters
-    adc_cfg[0].InitSingle(A0); // TIMBRE (invert)
-    adc_cfg[1].InitSingle(A1); // PITCH  (invert)
-    adc_cfg[2].InitSingle(A2); // SPREAD (invert)
-    adc_cfg[3].InitSingle(A3); // MORPH  (invert)
-    adc_cfg[4].InitSingle(A4); // SSYNC gate (used as >0.5 => on)
-    adc_cfg[5].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2); // pots
-    adc_cfg[6].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2); // attenuverters
+    adc_cfg[0].InitSingle(A0);
+    adc_cfg[1].InitSingle(A1);
+    adc_cfg[2].InitSingle(A2);
+    adc_cfg[3].InitSingle(A3);
+    adc_cfg[4].InitSingle(A4);
+    adc_cfg[5].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2);
+    adc_cfg[6].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2);
     hw.adc.Init(adc_cfg, 7);
     hw.adc.Start();
 
-    // Shared core setup
     CoreParams params;
     params.sampleRate = 48000.0;
     VoxCore core;
@@ -73,14 +68,11 @@ int main(void)
         static float fm[kBlock], hsync[kBlock], ssync[kBlock];
         static int idx = kBlock;
 
-        // Static env followers for presence detection
-        static float envL = 0.f;
-        static float envR = 0.f;
+        static float envL = 0.f, envR = 0.f;
 
         if(idx >= kBlock) {
             idx = 0;
 
-            // ---- Read controls once per tick ----
             const float kPitch  = hw.adc.GetMuxFloat(5, CH_PITCH);
             const float kMorph  = hw.adc.GetMuxFloat(5, CH_MORPH);
             const float kSpread = hw.adc.GetMuxFloat(5, CH_SPREAD);
@@ -104,34 +96,29 @@ int main(void)
             c.timbre01    = quantize12(apply_cv_att_hw(kTimbre, CV_Timbre, at_timbre));
             c.spread01    = quantize12(apply_cv_att_hw(kSpread, CV_Spread, at_spread));
 
-            // ---- Audio-rate signals (read first interleaved frame) ----
-            // Interleaved input: in[0]=L0, in[1]=R0, in[2]=L1, ...
-            float lin0 = 0.f, rin0 = 0.f;
-            if(in) {
-                lin0 = in[0];
-                rin0 = (size >= 2) ? in[1] : 0.f;
-            }
+            // Fill audio-rate arrays from interleaved input per frame
+            // size should be 2*kBlock when blocksize=48
+            for (int i = 0; i < kBlock; ++i) {
+                const int ii = i * 2;
+                float lin = (ii + 0 < (int)size) ? in[ii + 0] : 0.f;
+                float rin = (ii + 1 < (int)size) ? in[ii + 1] : 0.f;
 
-            // Presence detection with AR envs
-            const float aL = (fabsf(lin0) > envL) ? HSYNC_ENV_ATTACK : HSYNC_ENV_RELEASE;
-            envL = (1.f - aL) * envL + aL * fabsf(lin0);
-            const bool hsync_on = envL > HSYNC_ENV_THRESH;
+                // Presence detection (per-sample)
+                float aL = (fabsf(lin) > envL) ? HSYNC_ENV_ATTACK : HSYNC_ENV_RELEASE;
+                envL = (1.f - aL) * envL + aL * fabsf(lin);
+                float aR = (fabsf(rin) > envR) ? FM_ENV_ATTACK    : FM_ENV_RELEASE;
+                envR = (1.f - aR) * envR + aR * fabsf(rin);
 
-            const float aR = (fabsf(rin0) > envR) ? FM_ENV_ATTACK : FM_ENV_RELEASE;
-            envR = (1.f - aR) * envR + aR * fabsf(rin0);
-            const bool fm_on = envR > FM_ENV_THRESH;
-
-            for(int i = 0; i < kBlock; ++i) {
-                hsync[i] = hsync_on ? lin0 : 0.f;
-                fm[i]    = fm_on    ? rin0 : 0.f;
+                hsync[i] = (envL > HSYNC_ENV_THRESH) ? lin : 0.f;
+                fm[i]    = (envR > FM_ENV_THRESH)    ? rin : 0.f;
                 ssync[i] = ssGate;
             }
 
             Mods m;
-            m.hsync     = hsync_on ? hsync : nullptr;
-            m.fm        = fm_on    ? fm    : nullptr;
+            m.hsync     = hsync;
+            m.fm        = fm;
             m.ssync     = ssync;
-            m.fmDepthHz = 440.0; // tune as needed
+            m.fmDepthHz = 440.0;
 
             static CoreParams p = {48000.0, 440.0, 5};
             static VoxCore core_local;
@@ -141,7 +128,6 @@ int main(void)
             core_local.processBlock(p, c, m, s, L, R, kBlock);
         }
 
-        // ---- Output interleaved ----
         for(size_t i = 0; i < size; i += 2) {
             out[i + 0] = L[idx];
             out[i + 1] = R[idx];
