@@ -8,29 +8,31 @@
 
 namespace vm { namespace vox {
 
-static inline double clamp01(double x) {
-    return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x);
-}
+static inline double clamp01(double x) { return x < 0.0 ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
 struct CoreParams {
     double sampleRate = 48000.0;
     double baseA4 = 440.0;
-    int    kPitchMacroOctaves = 5; // +/- octaves range via knob
+    int    kPitchMacroOctaves = 5;
 };
 
 struct Controls {
-    double pitchKnob01 = 0.5; // 0..1
-    double morph01     = 0.0; // 0=square, 1=sine
-    double timbre01    = 0.5; // PWM depth center
-    double spread01    = 1.0; // amplitude scalar
+    double pitchKnob01 = 0.5;
+    double morph01     = 0.0; // 0=square,1=sine
+    double timbre01    = 0.5; // PWM depth
+    double spread01    = 1.0; // amplitude
 };
 
 struct Mods {
-    // reserved for Phase C (v/oct, fm, sync...)
+    // Audio-rate inputs (may be nullptr if unused)
+    const float* hsync = nullptr; // use rising zero-crossings for hard sync
+    const float* fm    = nullptr; // linear FM input (-1..+1 suggested)
+    const float* ssync = nullptr; // soft sync gate ( >0.5 triggers reset )
+    double fmDepthHz = 0.0;       // FM depth in Hz (0 to disable)
 };
 
 struct State {
-    double phase = 0.0; // 0..1
+    double phase = 0.0;
 };
 
 class VoxCore {
@@ -43,38 +45,58 @@ public:
                       const Mods& m,
                       State& s,
                       float* outL, float* outR, int nframes) {
-        (void)m;
         params_ = p;
 
         const double semisSpan = params_.kPitchMacroOctaves * 12.0;
         const double knobSemis = (clamp01(k.pitchKnob01) * 2.0 - 1.0) * semisSpan;
-        const double freq = hzFromSemis(knobSemis, params_.baseA4);
+        const double f0 = hzFromSemis(knobSemis, params_.baseA4);
         const double dt = 1.0 / params_.sampleRate;
 
         const double morph = clamp01(k.morph01);
         const double pwmDepth = clamp01(k.timbre01);
         const double amp = clamp01(k.spread01);
 
-        // Map timbre to duty with safe clamp (5%..95%).
-        const double duty = 0.5 + (pwmDepth - 0.5) * 0.9; // +/-45% around 50%
-        const double dutySafe = clampDuty(duty);
+        const double duty = clampDuty(0.5 + (pwmDepth - 0.5) * 0.9);
+
+        float prev_hs = 0.f;
+        if (m.hsync) prev_hs = m_hsPrev; // keep continuity across blocks
 
         for (int i = 0; i < nframes; ++i) {
-            s.phase += freq * dt;
-            if (s.phase >= 1.0) s.phase -= std::floor(s.phase);
+            // Hard/soft sync handling
+            if (m.hsync) {
+                float hs = m.hsync[i];
+                if (prev_hs <= 0.f && hs > 0.f) {
+                    s.phase = 0.0;
+                }
+                prev_hs = hs;
+            }
+            if (m.ssync && m.ssync[i] > 0.5f) {
+                s.phase = 0.0;
+            }
 
-            // PWM square
-            double pulse = (s.phase < dutySafe) ? 1.0 : -1.0;
-            // Sine
-            double sine = std::sin(2.0 * M_PI * s.phase);
-            // Morph
+            // Linear FM (Hz) at audio rate
+            double fmHz = 0.0;
+            if (m.fm && m.fmDepthHz != 0.0) {
+                fmHz = (double)m.fm[i] * m.fmDepthHz;
+            }
+
+            double freq = f0 + fmHz;
+            if (freq < 0.0) freq = 0.0;
+
+            s.phase += freq * dt;
+            if (s.phase >= 1.0) {
+                s.phase -= std::floor(s.phase);
+            }
+
+            double pulse = (s.phase < duty) ? 1.0 : -1.0;
+            double sine  = std::sin(2.0 * M_PI * s.phase);
             double y = (1.0 - morph) * pulse + morph * sine;
-            // Spread as amplitude
             y *= amp;
 
-            outL[i] = static_cast<float>(y);
-            outR[i] = static_cast<float>(y);
+            outL[i] = (float)y;
+            outR[i] = (float)y;
         }
+        m_hsPrev = prev_hs;
     }
 
 private:
@@ -90,6 +112,7 @@ private:
 
     CoreParams params_;
     State st_;
+    float m_hsPrev = 0.f;
 };
 
 }} // namespace vm::vox

@@ -1,4 +1,4 @@
-# VOX — Daisy firmware Makefile (robust Phase B parity)
+# VOX — Daisy firmware Makefile (shared core Phase C)
 TARGET = firmware
 
 CPP_SOURCES = \
@@ -33,7 +33,7 @@ ifneq ($(DAISYSP_DIR),)
 C_INCLUDES += -I$(DAISYSP_DIR)/Source
 endif
 
-C_INCLUDES += -I../src -I../src/dsp
+C_INCLUDES += -I../src -I../src/dsp -I../src/hal
 
 C_DEFS += -DDEBUG -DDAISY_USE_FPU=1
 OPT ?= -O3

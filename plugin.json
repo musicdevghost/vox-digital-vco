@@ -1,15 +1,15 @@
 {
   "slug": "voxvco",
+  "name": "VOX",
   "version": "2.0.0",
   "license": "proprietary",
-  "brand": "Voxmachina",
-  "author": "Voxmachina",
-  "name": "VOX",
+  "brand": "VOX",
+  "author": "You",
   "modules": [
     {
       "slug": "vox-vco",
       "name": "VOX",
-      "description": "Hardware-first simulator: Phase B (Pitch, Morph, Timbre/PWM, Spread).",
+      "description": "Hardware-first shared core: Pitch, Morph, Timbre/PWM, Spread. HSYNC/SSYNC/FM supported (Phase C).",
       "tags": [
         "Oscillator",
         "Digital"

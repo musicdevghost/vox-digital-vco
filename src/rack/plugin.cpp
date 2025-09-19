@@ -3,7 +3,6 @@
 #include "VoxSimModule.hpp"
 
 Plugin* pluginInstance = nullptr;
-// Keep legacy slug so old patches load
 Model* modelVOX = createModel<VoxSimModule, VoxTemplateWidget>("vox-vco");
 
 void init(Plugin* p) {

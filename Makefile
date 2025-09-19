@@ -6,8 +6,7 @@ CXXFLAGS += -Isrc
 SOURCES := \
   src/rack/plugin.cpp \
   src/rack/VoxSimModule.cpp \
-  src/dsp/VoxCore.cpp \
-  src/hw/sim_hal.cpp
+  src/dsp/VoxCore.cpp
 
 DISTRIBUTABLES += plugin.json README.md
 include $(RACK_DIR)/plugin.mk
