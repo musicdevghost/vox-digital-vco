@@ -3,6 +3,7 @@
 #include <cmath>
 #include "../src/dsp/VoxCore.hpp"
 #include "../src/hal/ControlMap.hpp"
+#include "../src/shared/Config.hpp"
 
 using namespace daisy;
 using namespace daisy::seed;
@@ -118,7 +119,7 @@ int main(void)
             m.hsync     = hsync;
             m.fm        = fm;
             m.ssync     = ssync;
-            m.fmDepthHz = 440.0;
+            m.fmDepthHz = vm::vox::cfg::kDefaultFmDepthHz;
 
             static CoreParams p = {48000.0, 440.0, 5};
             static VoxCore core_local;
