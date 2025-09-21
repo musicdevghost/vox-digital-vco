@@ -1,15 +1,7 @@
-// Vox — smoother Spread + band-limited PWM + easy output cap
-// Everything else (mappings, LED/AUX RMS followers, Morph/Timbre roles, AGC) unchanged.
-//
-// Controls:
-//  • Morph (KNOB 1 / CV_IN 3 / AT idx 3): Sine → Tri → Saw → Square (smooth crossfade)
-//  • Timbre (KNOB 3 / CV_IN 0 / AT idx 0): per-shape mod
-//      - Sine/Tri: soft wavefold
-//      - Saw: phase-multiply (sync-like harmonics, base period kept)
-//      - Square: PWM (5–95%) — polyBLEP (no spikes)
-//  • Spread = unison swarm (smooth), with fractional voice fade & AGC so level stays stable.
-//  • LED (A7) & AUX (A8) follow POST-gain audio (RMS).
-//  • Master output cap constant: kOutputLimit.
+// Vox — LED fix + elastic AUX/ENV out
+// • LED now uses the same envelope value as AUX (with optional inversion).
+// • AUX/ENV out has more "elastic" movement via gain+gamma shaping.
+// • Everything else (mappings, Spread/AGC/osc) unchanged.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -19,13 +11,26 @@ using namespace daisy::seed;
 
 DaisySeed hw;
 
-// ======================= Tunables =========================
-static constexpr float kOutputLimit   = 0.40f; // master output cap (adjust to taste)
-static constexpr float kSpreadTauSec  = 0.030f; // Spread smoothing time-constant (~30 ms)
-static constexpr float kAgcMin        = 0.5f;   // AGC clamp min/max
+// ======================= Tunables (NEW) ===================
+static constexpr float kOutputLimit   = 0.40f; // master output cap (unchanged)
+static constexpr float kSpreadTauSec  = 0.030f; // Spread smoothing (~30 ms)
+
+// Envelope follower feel (for both LED & AUX)
+static constexpr float kEnvAtkMs      = 6.0f;   // faster "snap"
+static constexpr float kEnvRelMs      = 140.0f; // elastic but not pumpy
+static constexpr float kEnvGain       = 1.6f;   // boosts low/mid levels
+static constexpr float kEnvGamma      = 0.65f;  // <1 expands, >1 compresses
+
+// LED behavior
+static constexpr bool  kLedInvert     = true;   // invert if LED is current-sink
+// ==========================================================
+
+// ======================= AGC Tunables =====================
+static constexpr float kAgcMin        = 0.5f;
 static constexpr float kAgcMax        = 2.0f;
-static constexpr float kAgcTargetRms  = 0.35f;  // target RMS before base gain
-static constexpr float kAgcSlew       = 0.0025f; // AGC smoothing per sample
+static constexpr float kAgcTargetRms  = 0.35f;
+static constexpr float kAgcSlew       = 0.0025f;
+// ==========================================================
 
 // ======================= Pins / Mapping ===================
 #define MUX1_COM_PIN  A5
@@ -49,7 +54,6 @@ static constexpr float kAgcSlew       = 0.0025f; // AGC smoothing per sample
 #define AT_CH_MORPH   3   // affects Morph CV
 
 enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
-// A0..A3 are inverting; SSYNC (A4) is raw (active-low).
 static constexpr float CV_POL_TIMBRE = -1.0f;
 static constexpr float CV_POL_VOCT   = -1.0f;
 static constexpr float CV_POL_SPREAD = -1.0f;
@@ -91,7 +95,7 @@ static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
 
 // ---- Envelope followers ----
-// Post-gain RMS (drives LED & AUX)
+// Post-gain power follower (drives LED & AUX)
 static float env2 = 0.f;   // smoothed power
 static float env_atk2 = 0; // set in main()
 static float env_rel2 = 0;
@@ -247,7 +251,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         float cents  = shaped * detune_cents;
         detune_factor[v] = powf(2.f, cents / 1200.f);
 
-        float w = (v < v_int) ? 1.0f : v_frac; // last voice fades in
+        float w = (v < v_int) ? 1.0f : v_frac;
         vweight[v] = w;
         wsum += w;
     }
@@ -294,16 +298,26 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         out[0][i] = y;
         out[1][i] = y;
 
-        // --- POST-gain RMS follower → LED/AUX ---
+        // --- POST-gain RMS follower → LED/AUX (UPDATED) ---
+        // Power follower
         float y2   = y * y;
         float coef = (y2 > env2) ? env_atk2 : env_rel2;
         env2 += coef * (y2 - env2);
-        float env_lin = sqrtf(env2);
-        float env_out = powf(clamp01(env_lin), 0.6f); // perceptual
 
-        // A7 LED and A8 AUX output the same follower (non-inverted)
-        dac.WriteValue(LED_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
-        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
+        // Convert to linear envelope, then shape for more elastic movement.
+        float env_lin = sqrtf(env2); // 0..~1 typical
+        // Slightly scale with Spread so wide swarms push the meter a touch more.
+        float spread_boost = 0.9f + 0.2f * spread; // 0.9..1.1
+        float env_shaped = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
+        if(env_shaped > 1.f) env_shaped = 1.f;
+
+        // AUX/ENV (A8): 0..4095 (your analog stage maps this to ~0..5V)
+        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_shaped * 4095.f));
+
+        // LED (A7): same value as AUX, optionally inverted for LED driver
+        uint16_t led_dac = (uint16_t)(env_shaped * 4095.f);
+        if(kLedInvert) led_dac = 4095 - led_dac;
+        dac.WriteValue(LED_DAC_CHANNEL, led_dac);
     }
 }
 
@@ -339,11 +353,11 @@ int main(void)
 
     const float sr = hw.AudioSampleRate();
 
-    // POST-gain follower (LED/AUX): ~10 ms attack, ~120 ms release (power domain)
-    env_atk2 = 1.0f / (0.010f * sr);
-    env_rel2 = 1.0f / (0.120f * sr);
+    // Followers (post-gain) — use new attack/release
+    env_atk2 = 1.0f / ((kEnvAtkMs / 1000.f) * sr);
+    env_rel2 = 1.0f / ((kEnvRelMs / 1000.f) * sr);
 
-    // PRE-gain follower (AGC): slightly slower to avoid pumping
+    // AGC pre-gain follower (unchanged)
     pre_atk2 = 1.0f / (0.040f * sr); // ~40 ms
     pre_rel2 = 1.0f / (0.400f * sr); // ~400 ms
 
