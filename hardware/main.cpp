@@ -1,10 +1,15 @@
 // Vox — smoother Spread + band-limited PWM + easy output cap
-// Changes:
-//  • Spread: parameter smoothing + continuous voice fade (fractional 1..7)
-//  • Square/PWM: polyBLEP band-limited (no more small spikes)
-//  • Output cap constant: kOutputLimit (default 0.40f)
-//
 // Everything else (mappings, LED/AUX RMS followers, Morph/Timbre roles, AGC) unchanged.
+//
+// Controls:
+//  • Morph (KNOB 1 / CV_IN 3 / AT idx 3): Sine → Tri → Saw → Square (smooth crossfade)
+//  • Timbre (KNOB 3 / CV_IN 0 / AT idx 0): per-shape mod
+//      - Sine/Tri: soft wavefold
+//      - Saw: phase-multiply (sync-like harmonics, base period kept)
+//      - Square: PWM (5–95%) — polyBLEP (no spikes)
+//  • Spread = unison swarm (smooth), with fractional voice fade & AGC so level stays stable.
+//  • LED (A7) & AUX (A8) follow POST-gain audio (RMS).
+//  • Master output cap constant: kOutputLimit.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -15,7 +20,7 @@ using namespace daisy::seed;
 DaisySeed hw;
 
 // ======================= Tunables =========================
-static constexpr float kOutputLimit   = 0.40f; // master output cap (was 0.45f)
+static constexpr float kOutputLimit   = 0.40f; // master output cap (adjust to taste)
 static constexpr float kSpreadTauSec  = 0.030f; // Spread smoothing time-constant (~30 ms)
 static constexpr float kAgcMin        = 0.5f;   // AGC clamp min/max
 static constexpr float kAgcMax        = 2.0f;
@@ -38,19 +43,20 @@ static constexpr float kAgcSlew       = 0.0025f; // AGC smoothing per sample
 #define MUX2_SEL1     D2
 #define MUX2_SEL2     D3
 
-#define AT_CH_TIMBRE  0
-#define AT_CH_PITCH   1
-#define AT_CH_SPREAD  2
-#define AT_CH_MORPH   3
+#define AT_CH_TIMBRE  0   // affects Timbre modulation CV
+#define AT_CH_PITCH   1   // affects V/Oct CV
+#define AT_CH_SPREAD  2   // affects Spread CV
+#define AT_CH_MORPH   3   // affects Morph CV
 
 enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
+// A0..A3 are inverting; SSYNC (A4) is raw (active-low).
 static constexpr float CV_POL_TIMBRE = -1.0f;
 static constexpr float CV_POL_VOCT   = -1.0f;
 static constexpr float CV_POL_SPREAD = -1.0f;
 static constexpr float CV_POL_MORPH  = -1.0f;
 
-static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8
-static constexpr DacHandle::Channel LED_DAC_CHANNEL = DacHandle::Channel::TWO; // A7
+static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8 = Aux/Env out
+static constexpr DacHandle::Channel LED_DAC_CHANNEL = DacHandle::Channel::TWO; // A7 = LED
 
 // ======================= IO State =========================
 AdcChannelConfig adc_cfg[7];
@@ -64,18 +70,18 @@ static float cv_morph_raw  = 0.f; // A3
 static float cv_ssync_raw  = 0.f; // A4 (unused for now)
 
 // Pots via MUX1
-static float kPitch  = 0.f;
-static float kMorph  = 0.f; // shape morph
-static float kSpread = 0.f; // swarm amount
-static float kTimbre = 0.f; // per-shape modulation
+static float kPitch  = 0.f; // pitch
+static float kMorph  = 0.f; // shape morph  (0..1)
+static float kSpread = 0.f; // swarm amount (0..1)
+static float kTimbre = 0.f; // modulation   (0..1)
 
 // Attenuverters via MUX2 (0..1 → -1..+1)
-static float at_timbre = 0.f;
-static float at_pitch  = 0.f;
-static float at_spread = 0.f;
-static float at_morph  = 0.f;
+static float at_timbre = 0.f; // idx 0
+static float at_pitch  = 0.f; // idx 1
+static float at_spread = 0.f; // idx 2
+static float at_morph  = 0.f; // idx 3
 
-// Baselines for deviation CVs
+// Baselines for CVs that use deviation
 static float cv_timbre_base = 0.5f;
 static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
@@ -84,12 +90,13 @@ static float cv_morph_base  = 0.5f;
 static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
 
-// Envelope followers (post-gain → LED/AUX)
+// ---- Envelope followers ----
+// Post-gain RMS (drives LED & AUX)
 static float env2 = 0.f;   // smoothed power
 static float env_atk2 = 0; // set in main()
 static float env_rel2 = 0;
 
-// Pre-gain RMS (AGC)
+// Pre-gain RMS (drives AGC so Spread changes don't change loudness)
 static float pre_env2 = 0.f;
 static float pre_atk2 = 0;
 static float pre_rel2 = 0;
@@ -109,12 +116,10 @@ static inline void  track_baseline(float in01, float &base, float alpha = 0.0005
 // Basic waves
 static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
 static inline float wave_tri(float ph)    { return 1.f - 4.f * fabsf(ph - 0.5f); }
-static inline float wave_saw(float ph)    { return 2.f * ph - 1.f; }
 
 // ---- polyBLEP for band-limited transitions ----
 static inline float poly_blep(float t, float dt)
 {
-    // t in [0,1), dt = phase increment in [0,1]
     if(t < dt)
     {
         t /= dt;
@@ -140,9 +145,9 @@ static inline float wave_square_pwm_blep(float ph, float duty, float dt)
     // upward step at ph = 0.0
     y -= poly_blep(ph, dt);
     // downward step at ph = duty
-    float t = ph - duty;
-    if(t < 0.f) t += 1.f;
-    y += poly_blep(t, dt);
+    float tt = ph - duty;
+    if(tt < 0.f) tt += 1.f;
+    y += poly_blep(tt, dt);
 
     return y;
 }
@@ -154,12 +159,11 @@ static inline float softFold(float x, float amt)
     return tanhf(drive * x);
 }
 
-// Saw "multiply" (sync-like harmonics) — keeps base period
+// Saw phase-multiply (sync-like) keeping base period
 static inline float wave_saw_multiply(float ph, float mult_amt)
 {
     float mul = 1.f + 4.f * clamp01(mult_amt); // 1..5
-    float ph2 = ph * mul;
-    ph2 = ph2 - floorf(ph2); // fract
+    float ph2 = ph * mul - floorf(ph * mul);
     return 2.f * ph2 - 1.f;
 }
 
@@ -169,14 +173,12 @@ static inline float wave_morph_with_timbre(float ph, float morph01, float timbre
     morph01  = clamp01(morph01);
     timbre01 = clamp01(timbre01);
 
-    // Build modded versions of each primitive with same timbre amount.
-    float s_sin = softFold(wave_sine(ph), timbre01);        // fold
-    float s_tri = softFold(wave_tri(ph),  timbre01);        // fold
-    float s_saw = wave_saw_multiply(ph,   timbre01);        // multiply
-    float duty  = 0.5f + 0.45f * (timbre01 - 0.5f) * 2.f;   // ~5..95%
-    float s_sqr = wave_square_pwm_blep(ph, duty, dt);       // band-limited PWM
+    float s_sin = softFold(wave_sine(ph), timbre01);           // fold
+    float s_tri = softFold(wave_tri(ph),  timbre01);           // fold
+    float s_saw = wave_saw_multiply(ph,   timbre01);           // multiply
+    float duty  = 0.5f + 0.45f * (timbre01 - 0.5f) * 2.f;      // ~5..95%
+    float s_sqr = wave_square_pwm_blep(ph, duty, dt);          // PWM (polyBLEP)
 
-    // Three-segment blend: sine→tri → tri→saw → saw→square
     float idx = morph01 * 3.f;
     int   seg = (int)idx;                 // 0,1,2
     float t   = idx - float(seg);         // 0..1
@@ -191,18 +193,18 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     (void)in;
     const float sr = hw.AudioSampleRate();
 
-    // ---- Controls ----
-    const float basePitch   = kPitch;
-    const float baseMorph   = kMorph;
-    const float baseSpreadK = kSpread;
-    const float baseTimbre  = kTimbre;
+    // ---- Read/derive control values ----
+    const float basePitch   = kPitch;                    // 0..1
+    const float baseMorph   = kMorph;                    // 0..1 shape crossfade
+    const float baseSpreadK = kSpread;                   // 0..1 swarm
+    const float baseTimbre  = kTimbre;                   // 0..1 per-shape modulation
 
     const float cvTimbre = apply_uni(cv_timbre_raw, CV_POL_TIMBRE);
     const float cvVoct   = apply_uni(cv_voct_raw,   CV_POL_VOCT);
     const float cvSpread = apply_uni(cv_spread_raw, CV_POL_SPREAD);
     const float cvMorph  = apply_uni(cv_morph_raw,  CV_POL_MORPH);
 
-    // Baseline tracking for deviation paths
+    // update baselines for deviation-based CVs
     track_baseline(cvTimbre, cv_timbre_base);
     track_baseline(cvVoct,   cv_voct_base);
     track_baseline(cvMorph,  cv_morph_base);
@@ -212,16 +214,16 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float avSpread = uni_to_bi(at_spread);
     const float avMorph  = uni_to_bi(at_morph);
 
-    // Final parameters
+    // Pitch (unchanged)
     const float pitch01 = clamp01(basePitch + avPitch * (cvVoct - cv_voct_base));
     const float baseHz  = 50.f + pitch01 * 1950.f;
 
+    // Morph & Timbre
     const float morph   = clamp01(baseMorph + avMorph  * (cvMorph - cv_morph_base));
     const float timbre  = clamp01(baseTimbre + avTimbre * (cvTimbre - cv_timbre_base));
 
-    // Spread: knob + attenuverted raw (classic), then smooth
+    // Spread (swarm amount) classic attenuverter + smoothing
     const float spread_target = clamp01(baseSpreadK + avSpread * (cvSpread - 0.5f));
-    // one-pole smoothing towards target
     spread_smooth += spread_alpha * (spread_target - spread_smooth);
     const float spread = spread_smooth;
 
@@ -240,14 +242,12 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 
     for(int v = 0; v < voices_used; ++v)
     {
-        // symmetric distribution -1..+1 across active voices
         float rel = (voices_used == 1) ? 0.f : (-1.f + 2.f * (float)v / (float)(voices_used - 1));
         float shaped = copysignf(powf(fabsf(rel), 0.75f), rel); // pull inner voices closer
         float cents  = shaped * detune_cents;
         detune_factor[v] = powf(2.f, cents / 1200.f);
 
-        // weight: full for the first v_int voices, fractional for the last one
-        float w = (v < v_int) ? 1.0f : v_frac;
+        float w = (v < v_int) ? 1.0f : v_frac; // last voice fades in
         vweight[v] = w;
         wsum += w;
     }
@@ -276,7 +276,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         float m2 = mix * mix;
         float pre_coef = (m2 > pre_env2) ? pre_atk2 : pre_rel2;
         pre_env2 += pre_coef * (m2 - pre_env2);
-        float pre_rms = sqrtf(pre_env2) + 1e-6f;
+        float pre_rms = sqrtf(pre_env2) + 1e-6f; // avoid div0
 
         // AGC desired gain
         float desired_gain = kAgcTargetRms / pre_rms;
@@ -301,6 +301,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         float env_lin = sqrtf(env2);
         float env_out = powf(clamp01(env_lin), 0.6f); // perceptual
 
+        // A7 LED and A8 AUX output the same follower (non-inverted)
         dac.WriteValue(LED_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
         dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
     }
@@ -338,11 +339,11 @@ int main(void)
 
     const float sr = hw.AudioSampleRate();
 
-    // Followers (post-gain)
-    env_atk2 = 1.0f / (0.010f * sr); // ~10 ms attack (power)
-    env_rel2 = 1.0f / (0.120f * sr); // ~120 ms release (power)
+    // POST-gain follower (LED/AUX): ~10 ms attack, ~120 ms release (power domain)
+    env_atk2 = 1.0f / (0.010f * sr);
+    env_rel2 = 1.0f / (0.120f * sr);
 
-    // AGC pre-gain follower (slower = smoother)
+    // PRE-gain follower (AGC): slightly slower to avoid pumping
     pre_atk2 = 1.0f / (0.040f * sr); // ~40 ms
     pre_rel2 = 1.0f / (0.400f * sr); // ~400 ms
 
@@ -354,7 +355,7 @@ int main(void)
     // Control polling
     while (1)
     {
-        // Direct CVs
+        // Direct CVs (raw 0..1)
         cv_timbre_raw = hw.adc.GetFloat(CV_TIMBRE);
         cv_voct_raw   = hw.adc.GetFloat(CV_VOCT);
         cv_spread_raw = hw.adc.GetFloat(CV_SPREAD);
