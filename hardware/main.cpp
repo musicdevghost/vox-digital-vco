@@ -1,6 +1,8 @@
-// Vox — stable mapping + per-sample swarm
-// Spread = unison swarm (1..7 voices + detune); per-sample update (no block jumps)
-// Pots/CVs/ATs exactly per mapping; SSYNC read but bypassed; A8=CV OUT, A7=LED.
+// Vox — stable mapping + per-sample swarm + LED & AUX ENV outs
+// Spread = unison swarm (1..7 voices + detune); per-sample update
+// Pots/CVs/ATs exactly per mapping; audio unchanged.
+// A7 (DAC CH2) = LED level meter (rectified audio)
+// A8 (DAC CH1) = AR envelope 0..1 triggered by SSYNC (A4 active-low)
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -36,14 +38,14 @@ DaisySeed hw;
 
 // ---------- CV inputs (direct ADCs) (do not change) ----------
 enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
-// A0..A3 are inverting; SSYNC (A4) is raw (active-low), read but not used to gate.
+// A0..A3 are inverting; SSYNC (A4) is raw (active-low).
 static constexpr float CV_POL_TIMBRE = -1.0f; // A0
 static constexpr float CV_POL_VOCT   = -1.0f; // A1
 static constexpr float CV_POL_SPREAD = -1.0f; // A2
 static constexpr float CV_POL_MORPH  = -1.0f; // A3
 
 // ---------- DAC modes ----------
-static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8 = CV OUT
+static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8 = Aux/Env out
 static constexpr DacHandle::Channel LED_DAC_CHANNEL = DacHandle::Channel::TWO; // A7 = LED
 
 // ADC and DAC
@@ -55,7 +57,7 @@ static float cv_timbre_raw = 0.f; // A0
 static float cv_voct_raw   = 0.f; // A1
 static float cv_spread_raw = 0.f; // A2
 static float cv_morph_raw  = 0.f; // A3
-static float cv_ssync_raw  = 0.f; // A4 (unused here)
+static float cv_ssync_raw  = 0.f; // A4 (active-low)
 
 // ---- Pots via MUX1 ----
 static float kPitch  = 0.f;
@@ -75,11 +77,19 @@ static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
 
 // DSP state
-static float lfo_phase = 0.f; // for AUX/CV OUT
+static float lfo_phase = 0.f; // not used anymore for AUX; kept if needed later
 
 // Unison phases (max 7 voices incl. center)
 static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
+
+// ---- Aux ENV (A8) state ----
+enum EnvStage { IDLE, ATTACK, DECAY };
+static EnvStage env_stage = IDLE;
+static float    env_val   = 0.f;
+static float    env_att_inc = 0.f; // computed in main()
+static float    env_dec_inc = 0.f;
+static float    ssync_prev = 1.f;  // for edge detect (raw high by default)
 
 // ---------- helpers ----------
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
@@ -118,7 +128,6 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float cvVoct   = apply_uni(cv_voct_raw,   CV_POL_VOCT);
     const float cvSpread = apply_uni(cv_spread_raw, CV_POL_SPREAD);
     const float cvMorph  = apply_uni(cv_morph_raw,  CV_POL_MORPH);
-    (void)cv_ssync_raw; // read but unused here
 
     // update baselines
     track_baseline(cvTimbre, cv_timbre_base);
@@ -155,11 +164,11 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         detune_factor[v] = powf(2.f, cents / 1200.f);
     }
 
-    // Per-sample synthesis (fixes the “jumps”)
+    // Per-sample synthesis + LED/AUX env
     for(size_t i = 0; i < n; ++i)
     {
+        // --- AUDIO ---
         float mix = 0.f;
-
         for(int v = 0; v < voices; ++v)
         {
             float inc = (baseHz * detune_factor[v]) / sr;
@@ -168,8 +177,6 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 
             mix += wave_morph(phases[v], timbre);
         }
-
-        // average to keep level stable across voice counts
         if(voices > 0) mix *= (1.0f / (float)voices);
 
         float y = vol * mix;
@@ -177,17 +184,36 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         out[0][i] = y;
         out[1][i] = y;
 
-        // LED on A7: rectified level
+        // --- LED on A7: rectified level ---
         float led = fabsf(y);
         if(led > 1.f) led = 1.f;
         dac.WriteValue(LED_DAC_CHANNEL, (uint16_t)(led * 4095.f));
 
-        // A8: slow triangle 0..1
-        const float lfo_hz = 0.25f;
-        lfo_phase += lfo_hz / sr;
-        if(lfo_phase >= 1.f) lfo_phase -= 1.f;
-        float lfo = (lfo_phase < 0.5f) ? (lfo_phase * 2.f) : (2.f - lfo_phase * 2.f);
-        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(lfo * 4095.f));
+        // --- AUX ENV on A8: AR envelope triggered by SSYNC (active-low) ---
+        // Edge detect: falling edge (raw goes low)
+        float ss = cv_ssync_raw; // 0..1, low = active
+        bool trig = (ss < 0.25f) && (ssync_prev >= 0.25f);
+        ssync_prev = ss;
+
+        if(trig)
+        {
+            env_stage = ATTACK;
+        }
+
+        // advance envelope one sample
+        if(env_stage == ATTACK)
+        {
+            env_val += env_att_inc;
+            if(env_val >= 1.f) { env_val = 1.f; env_stage = DECAY; }
+        }
+        else if(env_stage == DECAY)
+        {
+            env_val -= env_dec_inc;
+            if(env_val <= 0.f) { env_val = 0.f; env_stage = IDLE; }
+        }
+
+        // write to DAC (0..1 → 0..4095)
+        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(clamp01(env_val) * 4095.f));
     }
 }
 
@@ -198,7 +224,7 @@ int main(void)
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     hw.SetAudioBlockSize(48);
 
-    // ADC setup — do not change mapping
+    // ----- ADC setup (mapping unchanged) -----
     adc_cfg[CV_TIMBRE].InitSingle(A0);
     adc_cfg[CV_VOCT  ].InitSingle(A1);
     adc_cfg[CV_SPREAD].InitSingle(A2);
@@ -213,17 +239,24 @@ int main(void)
     hw.adc.Init(adc_cfg, 7);
     hw.adc.Start();
 
-    // DAC setup A8(CH1)=CV OUT, A7(CH2)=LED
+    // ----- DAC setup -----
     DacHandle::Config dcfg;
     dcfg.bitdepth   = DacHandle::BitDepth::BITS_12;
     dcfg.buff_state = DacHandle::BufferState::ENABLED;
     dcfg.mode       = DacHandle::Mode::POLLING;
-    dcfg.chn        = DacHandle::Channel::BOTH;
+    dcfg.chn        = DacHandle::Channel::BOTH; // A8 (CH1) + A7 (CH2)
     dac.Init(dcfg);
+
+    // Precompute AR envelope increments (fixed A/D times)
+    const float sr = hw.AudioSampleRate();
+    const float att_s = 0.005f;  // 5 ms attack
+    const float dec_s = 0.200f;  // 200 ms decay
+    env_att_inc = (att_s > 0.f) ? (1.f / (att_s * sr)) : 1.f;
+    env_dec_inc = (dec_s > 0.f) ? (1.f / (dec_s * sr)) : 1.f;
 
     hw.StartAudio(AudioCb);
 
-    // Control polling
+    // Control polling (unchanged)
     while (1)
     {
         // Direct CVs (raw 0..1)
