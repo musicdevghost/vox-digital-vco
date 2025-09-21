@@ -1,8 +1,8 @@
-// Vox — stable mapping + per-sample swarm + LED & AUX ENV outs
-// Spread = unison swarm (1..7 voices + detune); per-sample update
-// Pots/CVs/ATs exactly per mapping; audio unchanged.
-// A7 (DAC CH2) = LED level meter (rectified audio)
-// A8 (DAC CH1) = AR envelope 0..1 triggered by SSYNC (A4 active-low)
+// Vox — stable mapping + per-sample swarm
+// LED (A7) and AUX/ENV (A8) are both audio envelope followers (RMS w/ attack/release + gamma).
+// • A7 (DAC CH2) = non-inverted write (bright = louder)
+// • A8 (DAC CH1) = non-inverted 0..4095
+// Everything else unchanged (controls, swarm, mappings). SSYNC is read but unused for now.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -18,31 +18,31 @@ DaisySeed hw;
 #define MUX1_SEL1     D6
 #define MUX1_SEL2     D7
 
-// Pots channel map (do not change)
-#define CH_PITCH   0  // KNOB 0
-#define CH_MORPH   1  // KNOB 1 (used here as volume)
-#define CH_SPREAD  2  // KNOB 2 (swarm)
-#define CH_TIMBRE  3  // KNOB 3 (wave morph)
+// Pots (do not change)
+#define CH_PITCH   0
+#define CH_MORPH   1  // used as volume
+#define CH_SPREAD  2  // swarm amount
+#define CH_TIMBRE  3  // wave morph
 
 // ---------- MUX2 (attenuverters): COM=A6, selects D1/D2/D3 ----------
 #define MUX2_COM_PIN  A6
-#define MUX2_SEL0     D1  // 4051 A (LSB)
-#define MUX2_SEL1     D2  // 4051 B
-#define MUX2_SEL2     D3  // 4051 C
+#define MUX2_SEL0     D1
+#define MUX2_SEL1     D2
+#define MUX2_SEL2     D3
 
-// Attenuverter channels (do not change)
-#define AT_CH_TIMBRE  0   // timbre attenuverter
-#define AT_CH_PITCH   1   // pitch attenuverter
-#define AT_CH_SPREAD  2   // spread attenuverter
-#define AT_CH_MORPH   3   // morph attenuverter
+// AT channels (do not change)
+#define AT_CH_TIMBRE  0
+#define AT_CH_PITCH   1
+#define AT_CH_SPREAD  2
+#define AT_CH_MORPH   3
 
 // ---------- CV inputs (direct ADCs) (do not change) ----------
 enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
 // A0..A3 are inverting; SSYNC (A4) is raw (active-low).
-static constexpr float CV_POL_TIMBRE = -1.0f; // A0
-static constexpr float CV_POL_VOCT   = -1.0f; // A1
-static constexpr float CV_POL_SPREAD = -1.0f; // A2
-static constexpr float CV_POL_MORPH  = -1.0f; // A3
+static constexpr float CV_POL_TIMBRE = -1.0f;
+static constexpr float CV_POL_VOCT   = -1.0f;
+static constexpr float CV_POL_SPREAD = -1.0f;
+static constexpr float CV_POL_MORPH  = -1.0f;
 
 // ---------- DAC modes ----------
 static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8 = Aux/Env out
@@ -57,7 +57,7 @@ static float cv_timbre_raw = 0.f; // A0
 static float cv_voct_raw   = 0.f; // A1
 static float cv_spread_raw = 0.f; // A2
 static float cv_morph_raw  = 0.f; // A3
-static float cv_ssync_raw  = 0.f; // A4 (active-low)
+static float cv_ssync_raw  = 0.f; // A4 (active-low, unused here)
 
 // ---- Pots via MUX1 ----
 static float kPitch  = 0.f;
@@ -71,32 +71,26 @@ static float at_pitch  = 0.f; // idx 1
 static float at_spread = 0.f; // idx 2
 static float at_morph  = 0.f; // idx 3
 
-// Baselines to remove DC from three CVs (pitch/timbre/morph)
+// Baselines for three CVs
 static float cv_timbre_base = 0.5f;
 static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
 
 // DSP state
-static float lfo_phase = 0.f; // not used anymore for AUX; kept if needed later
-
-// Unison phases (max 7 voices incl. center)
 static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
 
-// ---- Aux ENV (A8) state ----
-enum EnvStage { IDLE, ATTACK, DECAY };
-static EnvStage env_stage = IDLE;
-static float    env_val   = 0.f;
-static float    env_att_inc = 0.f; // computed in main()
-static float    env_dec_inc = 0.f;
-static float    ssync_prev = 1.f;  // for edge detect (raw high by default)
+// ---- Audio envelope follower shared by LED (A7) and AUX (A8) ----
+// We smooth y^2 with attack/release, then sqrt and apply a perceptual gamma.
+static float env2 = 0.f;   // smoothed power
+static float env_atk2 = 0; // set in main()
+static float env_rel2 = 0;
 
-// ---------- helpers ----------
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float lerp(float a, float b, float t){ return a + t * (b - a); }
 static inline float apply_uni(float cv01, float pol){ return pol >= 0.f ? cv01 : (1.f - cv01); }
-static inline float uni_to_bi(float u){ return (u * 2.f) - 1.f; } // 0..1 -> -1..+1
-static inline void track_baseline(float in01, float &base, float alpha = 0.0005f){ base += alpha * (in01 - base); }
+static inline float uni_to_bi(float u){ return (u * 2.f) - 1.f; }
+static inline void  track_baseline(float in01, float &base, float alpha = 0.0005f){ base += alpha * (in01 - base); }
 
 static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
 static inline float wave_tri(float ph)    { return 1.f - 4.f * fabsf(ph - 0.5f); }
@@ -118,7 +112,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     (void)in;
     const float sr = hw.AudioSampleRate();
 
-    // ---- Read/derive smoothed control values (0..1) ----
+    // ---- Read/derive control values ----
     const float basePitch   = kPitch;
     const float baseVol     = 0.05f + 0.95f * kMorph;
     const float baseSpreadK = kSpread;
@@ -146,7 +140,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float vol     = clamp01(baseVol    + avMorph  * (cvMorph  - cv_morph_base));
     const float timbre  = clamp01(baseTimbre + avTimbre * (cvTimbre - cv_timbre_base));
 
-    // Spread (swarm amount) uses straight attenuverter (classic DC control)
+    // Spread (swarm amount) classic attenuverter
     const float spread  = clamp01(baseSpreadK + avSpread * (cvSpread - 0.5f));
 
     // Map Spread → voice count and detune
@@ -154,7 +148,6 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float max_cents    = 30.0f;
     const float detune_cents = spread * max_cents;
 
-    // Precompute per-voice detune factors
     float detune_factor[kMaxVoices];
     for(int v = 0; v < voices; ++v)
     {
@@ -164,7 +157,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         detune_factor[v] = powf(2.f, cents / 1200.f);
     }
 
-    // Per-sample synthesis + LED/AUX env
+    // Per-sample synthesis + shared envelope follower
     for(size_t i = 0; i < n; ++i)
     {
         // --- AUDIO ---
@@ -184,36 +177,17 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         out[0][i] = y;
         out[1][i] = y;
 
-        // --- LED on A7: rectified level ---
-        float led = fabsf(y);
-        if(led > 1.f) led = 1.f;
-        dac.WriteValue(LED_DAC_CHANNEL, (uint16_t)(led * 4095.f));
+        // --- AUDIO ENVELOPE FOLLOWER (shared for LED and AUX) ---
+        float y2   = y * y;
+        float coef = (y2 > env2) ? env_atk2 : env_rel2;
+        env2 += coef * (y2 - env2);
+        float env_lin = sqrtf(env2);                   // 0..1 after RMS
+        float env_out = powf(clamp01(env_lin), 0.6f);  // perceptual
 
-        // --- AUX ENV on A8: AR envelope triggered by SSYNC (active-low) ---
-        // Edge detect: falling edge (raw goes low)
-        float ss = cv_ssync_raw; // 0..1, low = active
-        bool trig = (ss < 0.25f) && (ssync_prev >= 0.25f);
-        ssync_prev = ss;
-
-        if(trig)
-        {
-            env_stage = ATTACK;
-        }
-
-        // advance envelope one sample
-        if(env_stage == ATTACK)
-        {
-            env_val += env_att_inc;
-            if(env_val >= 1.f) { env_val = 1.f; env_stage = DECAY; }
-        }
-        else if(env_stage == DECAY)
-        {
-            env_val -= env_dec_inc;
-            if(env_val <= 0.f) { env_val = 0.f; env_stage = IDLE; }
-        }
-
-        // write to DAC (0..1 → 0..4095)
-        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(clamp01(env_val) * 4095.f));
+        // A7 LED (now non-inverted so brighter = louder)
+        dac.WriteValue(LED_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
+        // A8 AUX/ENV (non-inverted)
+        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_out * 4095.f));
     }
 }
 
@@ -247,12 +221,11 @@ int main(void)
     dcfg.chn        = DacHandle::Channel::BOTH; // A8 (CH1) + A7 (CH2)
     dac.Init(dcfg);
 
-    // Precompute AR envelope increments (fixed A/D times)
+    // Envelope follower time constants (RMS power domain):
+    // attack ≈ 10 ms, release ≈ 120 ms; tweak to taste.
     const float sr = hw.AudioSampleRate();
-    const float att_s = 0.005f;  // 5 ms attack
-    const float dec_s = 0.200f;  // 200 ms decay
-    env_att_inc = (att_s > 0.f) ? (1.f / (att_s * sr)) : 1.f;
-    env_dec_inc = (dec_s > 0.f) ? (1.f / (dec_s * sr)) : 1.f;
+    env_atk2 = 1.0f / (0.010f * sr);
+    env_rel2 = 1.0f / (0.120f * sr);
 
     hw.StartAudio(AudioCb);
 
@@ -264,7 +237,7 @@ int main(void)
         cv_voct_raw   = hw.adc.GetFloat(CV_VOCT);
         cv_spread_raw = hw.adc.GetFloat(CV_SPREAD);
         cv_morph_raw  = hw.adc.GetFloat(CV_MORPH);
-        cv_ssync_raw  = hw.adc.GetFloat(CV_SSYNC);
+        cv_ssync_raw  = hw.adc.GetFloat(CV_SSYNC); // read for future sync use
 
         // MUX1 (pots) on index 5
         kPitch  = hw.adc.GetMuxFloat(5, CH_PITCH);
