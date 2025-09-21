@@ -1,7 +1,6 @@
-// Vox — LED fix + elastic AUX/ENV out
-// • LED now uses the same envelope value as AUX (with optional inversion).
-// • AUX/ENV out has more "elastic" movement via gain+gamma shaping.
-// • Everything else (mappings, Spread/AGC/osc) unchanged.
+// Vox — Buchla-ish fold with reduced range
+// • Fold range tightened: subtle at low Timbre, capped max (≈2 stages, gentler drive/sat/enh)
+// • All else unchanged (mappings, Spread/unison, AGC, LED=AUX env follower, PWM polyBLEP, saw multiply)
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -11,26 +10,27 @@ using namespace daisy::seed;
 
 DaisySeed hw;
 
-// ======================= Tunables (NEW) ===================
+// ======================= Tunables =========================
 static constexpr float kOutputLimit   = 0.40f; // master output cap (unchanged)
 static constexpr float kSpreadTauSec  = 0.030f; // Spread smoothing (~30 ms)
 
-// Envelope follower feel (for both LED & AUX)
-static constexpr float kEnvAtkMs      = 6.0f;   // faster "snap"
-static constexpr float kEnvRelMs      = 140.0f; // elastic but not pumpy
-static constexpr float kEnvGain       = 1.6f;   // boosts low/mid levels
-static constexpr float kEnvGamma      = 0.65f;  // <1 expands, >1 compresses
+// Envelope follower feel (LED & AUX)
+static constexpr float kEnvAtkMs      = 6.0f;
+static constexpr float kEnvRelMs      = 140.0f;
+static constexpr float kEnvGain       = 1.6f;
+static constexpr float kEnvGamma      = 0.65f;
 
 // LED behavior
 static constexpr bool  kLedInvert     = true;   // invert if LED is current-sink
-// ==========================================================
+
+// ===== Fold range scaler (NEW): lower → gentler overall max =====
+static constexpr float kFoldRange     = 0.60f;  // 0..1. Try 0.50–0.70 to taste.
 
 // ======================= AGC Tunables =====================
 static constexpr float kAgcMin        = 0.5f;
 static constexpr float kAgcMax        = 2.0f;
 static constexpr float kAgcTargetRms  = 0.35f;
 static constexpr float kAgcSlew       = 0.0025f;
-// ==========================================================
 
 // ======================= Pins / Mapping ===================
 #define MUX1_COM_PIN  A5
@@ -54,6 +54,7 @@ static constexpr float kAgcSlew       = 0.0025f;
 #define AT_CH_MORPH   3   // affects Morph CV
 
 enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
+// A0..A3 are inverting; SSYNC (A4) is raw (active-low).
 static constexpr float CV_POL_TIMBRE = -1.0f;
 static constexpr float CV_POL_VOCT   = -1.0f;
 static constexpr float CV_POL_SPREAD = -1.0f;
@@ -95,20 +96,19 @@ static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
 
 // ---- Envelope followers ----
-// Post-gain power follower (drives LED & AUX)
-static float env2 = 0.f;   // smoothed power
-static float env_atk2 = 0; // set in main()
+static float env2 = 0.f;   // post-gain power follower (LED & AUX)
+static float env_atk2 = 0;
 static float env_rel2 = 0;
 
-// Pre-gain RMS (drives AGC so Spread changes don't change loudness)
+// Pre-gain RMS (AGC)
 static float pre_env2 = 0.f;
 static float pre_atk2 = 0;
 static float pre_rel2 = 0;
-static float agc_gain = 1.0f;  // smoothed compensation multiplier
+static float agc_gain = 1.0f;
 
 // Spread smoothing
 static float spread_smooth = 0.f;
-static float spread_alpha  = 0.f; // computed in main()
+static float spread_alpha  = 0.f;
 
 // ======================= Helpers ==========================
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
@@ -156,11 +156,46 @@ static inline float wave_square_pwm_blep(float ph, float duty, float dt)
     return y;
 }
 
-// Soft fold for sine/tri
-static inline float softFold(float x, float amt)
+// ===== Wavefolder: Buchla-ish multi-stage triangle wrap + soft saturation =====
+// Range reduced & tapered for finer control.
+//   • amt' = pow( clamp(amt * kFoldRange), 1.25 )   → gentle near 0, capped max
+//   • drive  : 1 .. 9
+//   • stages : 1 .. 2
+//   • bias   : up to ~0.10 (gentle asymmetry)
+//   • sat    : subtle, 0.9 .. 1.1
+//   • enh_mix: up to ~0.12 (digital spice)
+static inline float tri_wrap_core(float x)
 {
-    const float drive = 1.f + 9.f * clamp01(amt);
-    return tanhf(drive * x);
+    // Map any x to a centered triangle in [-1,1]
+    float u     = x * 0.5f + 0.5f;           // -1..1 -> 0..1
+    float m     = u - floorf(u);             // fract
+    float tri01 = 1.f - fabsf(m * 2.f - 1.f);
+    return tri01 * 2.f - 1.f;                // back to -1..1
+}
+
+static inline float buchlaish_fold(float x, float amt)
+{
+    // Taper & cap the effective amount
+    float a = clamp01(amt * kFoldRange);
+    a = powf(a, 1.25f);                      // finer low-end control
+
+    float drive  = 1.0f + 8.0f * a;          // 1..9
+    int   stages = 1 + (int)floorf(a * 1.9f); // 1..2
+    float bias   = 0.10f * a;                // gentle asymmetry
+    float sat    = 0.9f  + 0.20f * a;        // mild tanh strength
+
+    float y = x;
+    for(int s = 0; s < stages; ++s)
+    {
+        float b = ((s & 1) ? -1.f : 1.f) * bias; // alternate the bias per stage
+        y = tri_wrap_core((y + b) * drive);
+        y = tanhf(y * sat);
+    }
+
+    // Subtle digital enhancement (reduced range)
+    float enh_mix = 0.12f * a;               // up to 12%
+    float enh     = sinf((2.0f + 4.0f * a) * 0.5f * M_PI * y);
+    return lerp(y, 0.7f * y + 0.3f * enh, enh_mix);
 }
 
 // Saw phase-multiply (sync-like) keeping base period
@@ -171,14 +206,14 @@ static inline float wave_saw_multiply(float ph, float mult_amt)
     return 2.f * ph2 - 1.f;
 }
 
-// Morph engine with per-shape modulation
+// Morph engine with per-shape modulation (fold uses buchlaish_fold)
 static inline float wave_morph_with_timbre(float ph, float morph01, float timbre01, float dt)
 {
     morph01  = clamp01(morph01);
     timbre01 = clamp01(timbre01);
 
-    float s_sin = softFold(wave_sine(ph), timbre01);           // fold
-    float s_tri = softFold(wave_tri(ph),  timbre01);           // fold
+    float s_sin = buchlaish_fold(wave_sine(ph), timbre01);
+    float s_tri = buchlaish_fold(wave_tri(ph),  timbre01);
     float s_saw = wave_saw_multiply(ph,   timbre01);           // multiply
     float duty  = 0.5f + 0.45f * (timbre01 - 0.5f) * 2.f;      // ~5..95%
     float s_sqr = wave_square_pwm_blep(ph, duty, dt);          // PWM (polyBLEP)
@@ -218,7 +253,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float avSpread = uni_to_bi(at_spread);
     const float avMorph  = uni_to_bi(at_morph);
 
-    // Pitch (unchanged)
+    // Pitch
     const float pitch01 = clamp01(basePitch + avPitch * (cvVoct - cv_voct_base));
     const float baseHz  = 50.f + pitch01 * 1950.f;
 
@@ -273,14 +308,13 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
             float sig = wave_morph_with_timbre(phases[v], morph, timbre, inc);
             mix += vweight[v] * sig;
         }
-        // Normalize by sum of weights (keeps loudness stable as voices fade in/out)
         mix *= (1.0f / wsum);
 
-        // --- PRE-gain RMS follower for AGC (tracks spread loudness) ---
+        // --- PRE-gain RMS follower for AGC ---
         float m2 = mix * mix;
         float pre_coef = (m2 > pre_env2) ? pre_atk2 : pre_rel2;
         pre_env2 += pre_coef * (m2 - pre_env2);
-        float pre_rms = sqrtf(pre_env2) + 1e-6f; // avoid div0
+        float pre_rms = sqrtf(pre_env2) + 1e-6f;
 
         // AGC desired gain
         float desired_gain = kAgcTargetRms / pre_rms;
@@ -290,31 +324,26 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 
         // Apply base cap and AGC
         float y = kOutputLimit * agc_gain * mix;
-
-        // Safety clip
         if(y > 1.f)  y = 1.f;
         if(y < -1.f) y = -1.f;
 
         out[0][i] = y;
         out[1][i] = y;
 
-        // --- POST-gain RMS follower → LED/AUX (UPDATED) ---
-        // Power follower
+        // --- POST-gain RMS follower → LED/AUX ---
         float y2   = y * y;
         float coef = (y2 > env2) ? env_atk2 : env_rel2;
         env2 += coef * (y2 - env2);
 
-        // Convert to linear envelope, then shape for more elastic movement.
-        float env_lin = sqrtf(env2); // 0..~1 typical
-        // Slightly scale with Spread so wide swarms push the meter a touch more.
+        float env_lin   = sqrtf(env2);
         float spread_boost = 0.9f + 0.2f * spread; // 0.9..1.1
-        float env_shaped = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
+        float env_shaped  = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
         if(env_shaped > 1.f) env_shaped = 1.f;
 
-        // AUX/ENV (A8): 0..4095 (your analog stage maps this to ~0..5V)
+        // AUX/ENV (A8): 0..4095 → ~0..5V analog
         dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_shaped * 4095.f));
 
-        // LED (A7): same value as AUX, optionally inverted for LED driver
+        // LED (A7): same envelope (optionally inverted)
         uint16_t led_dac = (uint16_t)(env_shaped * 4095.f);
         if(kLedInvert) led_dac = 4095 - led_dac;
         dac.WriteValue(LED_DAC_CHANNEL, led_dac);
@@ -353,11 +382,11 @@ int main(void)
 
     const float sr = hw.AudioSampleRate();
 
-    // Followers (post-gain) — use new attack/release
+    // POST-gain follower (LED/AUX)
     env_atk2 = 1.0f / ((kEnvAtkMs / 1000.f) * sr);
     env_rel2 = 1.0f / ((kEnvRelMs / 1000.f) * sr);
 
-    // AGC pre-gain follower (unchanged)
+    // PRE-gain follower (AGC)
     pre_atk2 = 1.0f / (0.040f * sr); // ~40 ms
     pre_rel2 = 1.0f / (0.400f * sr); // ~400 ms
 
