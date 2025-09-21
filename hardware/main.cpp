@@ -1,7 +1,7 @@
-// Vox — Extended Morph + Tamed Spread + CV full-range stretch for ±5V LFOs
-// • NEW: CV/AT stretch so ±5V fully reaches modulation range on TIMBRE/MORPH/SPREAD.
-// • Bipolar deltas: d = (cv - 0.5) * 2, then scaled by attenuverter (−1..+1).
-// • Pitch path unchanged (keeps your feel). Heavy-guard & per-block DAC writes kept.
+// Vox — SSYNC as true hard sync (GPIO D18, active-low, per-sample)
+// Keeps: CV stretch (±5V), extended Morph, fold/additive, Spread smoothing/limits,
+// AGC, LED/AUX follower, heavy-guard. Only SSYNC path changed to a GPIO.
+// If your GATE_IN_1 is on D19 instead, change SYNC_PIN below to D19.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -22,8 +22,8 @@ static constexpr float kEnvRelMs         = 140.0f;
 static constexpr float kEnvGain          = 1.6f;
 static constexpr float kEnvGamma         = 0.65f;
 
-// LED behavior
-static constexpr bool  kLedInvert        = true;   // invert if LED is current-sink
+// LED behavior (inverted if LED is current-sink)
+static constexpr bool  kLedInvert        = true;
 
 // ======================= AGC Tunables =====================
 static constexpr float kAgcMin           = 0.5f;
@@ -31,28 +31,25 @@ static constexpr float kAgcMax           = 2.0f;
 static constexpr float kAgcTargetRms     = 0.35f;
 static constexpr float kAgcSlew          = 0.0025f;
 
-// ===== Fold range scaler (your config) =====
-static constexpr float kFoldRange        = 0.60f;
-
-// ===== Additive cap (your config) =====
-static constexpr int   kAddMaxHarm       = 8;      // absolute cap
-
-// ===== Unison limits (your config + gentle curve) =====
+// ===== Your config =====
+static constexpr float kFoldRange        = 0.60f;  // max fold intensity
+static constexpr int   kAddMaxHarm       = 8;      // additive absolute cap
 static constexpr int   kMaxVoices        = 5;      // hard cap voices
 static constexpr float kDetuneMaxCents   = 30.0f;  // max spread detune
 
-// ===== Heavy-guard thresholds =====
+// ===== Heavy-guard thresholds (worst-case protection) =====
 static constexpr float kHG_SpreadTh      = 0.85f;
 static constexpr float kHG_MorphTh       = 0.80f;
 static constexpr float kHG_TimbreTh      = 0.60f;
 
 // ===== CV/AT stretch (compensate 4051/ADC rails) =====
-static constexpr float kCvLo             = 0.03f;  // direct CVs often read ~0.03..0.97
+static constexpr float kCvLo             = 0.03f;  // direct CVs ~0.03..0.97
 static constexpr float kCvHi             = 0.97f;
-static constexpr float kMuxLo            = 0.04f;  // attenuverters over MUX2 ~0.04..0.96
+static constexpr float kMuxLo            = 0.04f;  // attenuverters ~0.04..0.96
 static constexpr float kMuxHi            = 0.96f;
 
 // ======================= Pins / Mapping ===================
+// Pots (MUX1)
 #define MUX1_COM_PIN  A5
 #define MUX1_SEL0     D5
 #define MUX1_SEL1     D6
@@ -63,42 +60,52 @@ static constexpr float kMuxHi            = 0.96f;
 #define CH_SPREAD  2  // KNOB 2  -> swarm
 #define CH_TIMBRE  3  // KNOB 3  -> fold depth / harmonic amount
 
+// Attenuverters (MUX2)
 #define MUX2_COM_PIN  A6
 #define MUX2_SEL0     D1
 #define MUX2_SEL1     D2
 #define MUX2_SEL2     D3
 
-#define AT_CH_TIMBRE  0   // affects Timbre modulation CV
-#define AT_CH_PITCH   1   // affects V/Oct CV
-#define AT_CH_SPREAD  2   // affects Spread CV
-#define AT_CH_MORPH   3   // affects Morph CV
+#define AT_CH_TIMBRE  0
+#define AT_CH_PITCH   1
+#define AT_CH_SPREAD  2
+#define AT_CH_MORPH   3
 
-enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3, CV_SSYNC = 4 };
-// A0..A3 are inverting; SSYNC (A4) is raw (active-low).
+// Direct CVs (A0..A3 only; SSYNC now uses GPIO)
+enum CvAdcIndex : int { CV_TIMBRE = 0, CV_VOCT = 1, CV_SPREAD = 2, CV_MORPH = 3 };
+
+// A0..A3 are inverting
 static constexpr float CV_POL_TIMBRE = -1.0f;
 static constexpr float CV_POL_VOCT   = -1.0f;
 static constexpr float CV_POL_SPREAD = -1.0f;
 static constexpr float CV_POL_MORPH  = -1.0f;
 
+// DACs
 static constexpr DacHandle::Channel AUX_DAC_CHANNEL = DacHandle::Channel::ONE; // A8 = Aux/Env out
 static constexpr DacHandle::Channel LED_DAC_CHANNEL = DacHandle::Channel::TWO; // A7 = LED
 
+// SSYNC (HARD SYNC) — GPIO settings
+// Your schematic shows GATE_IN_1 on a pin labeled "18/ADC3". Use D18 here.
+// If it's actually on the next pad, set to D19.
+static constexpr Pin  SYNC_PIN        = D19;
+static constexpr bool SYNC_ACTIVE_LOW = true;
+
 // ======================= IO State =========================
-AdcChannelConfig adc_cfg[7];
+AdcChannelConfig adc_cfg[6]; // 4 direct + 2 mux
 static DacHandle dac;
+static GPIO      sync_in;    // SSYNC digital input (note: GPIO, not Gpio)
 
 // Direct CVs (raw 0..1)
 static float cv_timbre_raw = 0.f; // A0
 static float cv_voct_raw   = 0.f; // A1
 static float cv_spread_raw = 0.f; // A2
 static float cv_morph_raw  = 0.f; // A3
-static float cv_ssync_raw  = 0.f; // A4 (unused for now)
 
 // Pots via MUX1
-static float kPitch  = 0.f; // pitch
-static float kMorph  = 0.f; // extended morph  (0..1)
-static float kSpread = 0.f; // swarm amount    (0..1)
-static float kTimbre = 0.f; // fold depth / harmonic amount (0..1)
+static float kPitch  = 0.f;
+static float kMorph  = 0.f;
+static float kSpread = 0.f;
+static float kTimbre = 0.f;
 
 // Attenuverters via MUX2 (0..1 → -1..+1)
 static float at_timbre = 0.f; // idx 0
@@ -106,7 +113,7 @@ static float at_pitch  = 0.f; // idx 1
 static float at_spread = 0.f; // idx 2
 static float at_morph  = 0.f; // idx 3
 
-// Baselines (kept only for pitch & minor drift control if needed)
+// Baselines
 static float cv_timbre_base = 0.5f;
 static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
@@ -129,6 +136,9 @@ static float agc_gain = 1.0f;
 static float spread_smooth = 0.f;
 static float spread_alpha  = 0.f;
 
+// SSYNC edge tracking
+static bool sync_prev = true; // idle (high) for active-low
+
 // ======================= Helpers ==========================
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float lerp(float a, float b, float t){ return a + t * (b - a); }
@@ -142,21 +152,18 @@ static inline float stretch01(float x, float lo, float hi){ return clamp01((x - 
 static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
 static inline float wave_tri(float ph)    { return 1.f - 4.f * fabsf(ph - 0.5f); }
 
-// ---- polyBLEP for band-limited transitions ----
+// polyBLEP helpers
 static inline float poly_blep(float t, float dt)
 {
     if(t < dt)           { t /= dt; return t + t - t * t - 1.0f; }
     else if(t > 1.f-dt)  { t = (t - 1.f) / dt; return t * t + t + t + 1.0f; }
     return 0.0f;
 }
-
-// Band-limited PWM square (duty 0..1, 5..95% internally), returns [-1,1]
 static inline float wave_square_pwm_blep(float ph, float duty, float dt)
 {
     duty = clamp01(duty);
     if(duty < 0.05f) duty = 0.05f;
     if(duty > 0.95f) duty = 0.95f;
-
     float y = (ph < duty) ? 1.0f : -1.0f;
     y -= poly_blep(ph, dt);
     float tt = ph - duty; if(tt < 0.f) tt += 1.f;
@@ -164,25 +171,22 @@ static inline float wave_square_pwm_blep(float ph, float duty, float dt)
     return y;
 }
 
-// ===== Wavefolder: Buchla-ish multi-stage triangle wrap + soft saturation =====
+// Buchla-ish folder
 static inline float tri_wrap_core(float x)
 {
-    float u     = x * 0.5f + 0.5f;           // -1..1 -> 0..1
-    float m     = u - floorf(u);             // fract
+    float u     = x * 0.5f + 0.5f;
+    float m     = u - floorf(u);
     float tri01 = 1.f - fabsf(m * 2.f - 1.f);
-    return tri01 * 2.f - 1.f;                // back to -1..1
+    return tri01 * 2.f - 1.f;
 }
-
 static inline float buchlaish_fold(float x, float amt)
 {
     float a = clamp01(amt * kFoldRange);
     a = powf(a, 1.25f);
-
-    float drive  = 1.0f + 8.0f * a;          // 1..9
-    int   stages = 1 + (int)floorf(a * 1.9f);// 1..2
+    float drive  = 1.0f + 8.0f * a;
+    int   stages = 1 + (int)floorf(a * 1.9f);
     float bias   = 0.10f * a;
     float sat    = 0.9f  + 0.20f * a;
-
     float y = x;
     for(int s = 0; s < stages; ++s)
     {
@@ -190,13 +194,12 @@ static inline float buchlaish_fold(float x, float amt)
         y = tri_wrap_core((y + b) * drive);
         y = tanhf(y * sat);
     }
-
     float enh_mix = 0.12f * a;
     float enh     = sinf((2.0f + 4.0f * a) * 0.5f * M_PI * y);
     return lerp(y, 0.7f * y + 0.3f * enh, enh_mix);
 }
 
-// Saw phase-multiply (sync-like) keeping base period
+// Saw multiply
 static inline float wave_saw_multiply(float ph, float mult_amt)
 {
     float mul = 1.f + 4.f * clamp01(mult_amt); // 1..5
@@ -204,74 +207,53 @@ static inline float wave_saw_multiply(float ph, float mult_amt)
     return 2.f * ph2 - 1.f;
 }
 
-// ===== Additive sine stack with external budget =====
+// Additive (budgeted)
 static inline float sine_additive_budgeted(float ph, float amt, float dt, int kmax)
 {
     amt = clamp01(amt);
     if(amt <= 1e-4f || kmax < 1) return 0.f;
-
-    // Nyquist safety
     int nyq = (int)fminf((0.49f / fmaxf(dt, 1e-6f)), (float)kmax);
     if(nyq < 1) return 0.f;
-
-    // Brighter spectrum at high amt
-    float p = 1.1f - 0.5f * amt;           // exponent for 1/k^p (1.1 → 0.6)
-    float odd_bias = 0.6f + 0.4f * amt;    // emphasize odds as amt rises
-
+    float p = 1.1f - 0.5f * amt;
+    float odd_bias = 0.6f + 0.4f * amt;
     float acc = 0.f, norm = 0.f;
-    for(int k = 2; k <= nyq + 1; ++k)      // start at 2nd harmonic
+    for(int k = 2; k <= nyq + 1; ++k)
     {
         float w = powf((float)k, -p);
         float ob = (k % 2) ? odd_bias : (1.0f - 0.5f * amt);
         w *= (0.7f + 0.3f * ob);
         norm += w;
-
         float pk = ph * (float)k; pk -= floorf(pk);
         acc += w * sinf(2.f * M_PI * pk);
     }
     if(norm > 1e-6f) acc /= norm;
-
-    float mix = 0.25f + 0.75f * amt;       // stronger high-end
+    float mix = 0.25f + 0.75f * amt;
     return mix * acc;
 }
 
-// ===== Extended Morph path (6 nodes) =====
-// nodes: 0: sine(fold)  1: tri(fold)  2: saw(multiply)  3: square(PWM)
-//        4: tri(fold)   5: sine(additive)
+// Morph path (6 nodes)
 static inline float wave_node(int node, float ph, float timbre, float dt, int add_budget)
 {
     switch(node)
     {
-        case 0: return buchlaish_fold(wave_sine(ph), timbre);                 // folded sine
-        case 1: return buchlaish_fold(wave_tri(ph),  timbre);                 // folded tri
-        case 2: return wave_saw_multiply(ph, timbre);                         // multiply saw
-        case 3: { // PWM square (polyBLEP), timbre -> duty
-            float duty = 0.5f + 0.45f * (timbre - 0.5f) * 2.f;                // ~5..95%
-            return wave_square_pwm_blep(ph, duty, dt);
-        }
-        case 4: return buchlaish_fold(wave_tri(ph),  0.6f * timbre);          // tri again, gentler fold
+        case 0: return buchlaish_fold(wave_sine(ph), timbre);
+        case 1: return buchlaish_fold(wave_tri(ph),  timbre);
+        case 2: return wave_saw_multiply(ph, timbre);
+        case 3: { float duty = 0.5f + 0.45f * (timbre - 0.5f) * 2.f; return wave_square_pwm_blep(ph, duty, dt); }
+        case 4: return buchlaish_fold(wave_tri(ph),  0.6f * timbre);
         default:
-        case 5: { // sine + additive (budgeted)
-            float base = wave_sine(ph);
-            float add  = sine_additive_budgeted(ph, timbre, dt, add_budget);
-            float y    = base + add;
-            return tanhf(0.95f * y); // mild safety
-        }
+        case 5: { float base = wave_sine(ph); float add = sine_additive_budgeted(ph, timbre, dt, add_budget);
+                  return tanhf(0.95f * (base + add)); }
     }
 }
-
 static inline float wave_morph_extended(float ph, float morph01, float timbre01, float dt, int add_budget)
 {
     morph01  = clamp01(morph01);
     timbre01 = clamp01(timbre01);
-
-    // 6 nodes → 5 segments
-    float idx = morph01 * 5.f;     // seg index 0..5
-    int   seg = (int)idx;          // 0..4
-    if(seg > 4) seg = 4;
-    float t   = idx - (float)seg;  // 0..1 within segment
-    float ts  = smoothstep01(t);   // smoother crossfade
-
+    float idx = morph01 * 5.f;
+    int   seg = (int)idx; if(seg > 4) seg = 4;
+    float t   = idx - (float)seg;
+    float ts  = smoothstep01(t);
     float a = wave_node(seg,     ph, timbre01, dt, add_budget);
     float b = wave_node(seg + 1, ph, timbre01, dt, add_budget);
     return lerp(a, b, ts);
@@ -282,103 +264,102 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     (void)in;
     const float sr = hw.AudioSampleRate();
 
-    // ---- Read/derive control values ----
-    const float basePitch   = kPitch;                    // 0..1
-    const float baseMorph   = kMorph;                    // 0..1
-    const float baseSpreadK = kSpread;                   // 0..1
-    const float baseTimbre  = kTimbre;                   // 0..1
+    // ---- Control values ----
+    const float basePitch   = kPitch;
+    const float baseMorph   = kMorph;
+    const float baseSpreadK = kSpread;
+    const float baseTimbre  = kTimbre;
 
-    // --- Raw CVs ---
-    float cvTimbre_raw = apply_uni(::cv_timbre_raw, CV_POL_TIMBRE);
-    float cvVoct_raw   = apply_uni(::cv_voct_raw,   CV_POL_VOCT);
-    float cvSpread_raw = apply_uni(::cv_spread_raw, CV_POL_SPREAD);
-    float cvMorph_raw  = apply_uni(::cv_morph_raw,  CV_POL_MORPH);
+    // CVs → polarity-corrected then stretched
+    float cvTimbre = stretch01(apply_uni(cv_timbre_raw, CV_POL_TIMBRE), kCvLo, kCvHi);
+    float cvVoct   = stretch01(apply_uni(cv_voct_raw,   CV_POL_VOCT),   kCvLo, kCvHi);
+    float cvSpread = stretch01(apply_uni(cv_spread_raw, CV_POL_SPREAD), kCvLo, kCvHi);
+    float cvMorph  = stretch01(apply_uni(cv_morph_raw,  CV_POL_MORPH),  kCvLo, kCvHi);
 
-    // --- Stretch CVs to use full range (compensate 0.03..0.97) ---
-    const float cvTimbre = stretch01(cvTimbre_raw, kCvLo, kCvHi);
-    const float cvVoct   = stretch01(cvVoct_raw,   kCvLo, kCvHi);
-    const float cvSpread = stretch01(cvSpread_raw, kCvLo, kCvHi);
-    const float cvMorph  = stretch01(cvMorph_raw,  kCvLo, kCvHi);
-
-    // --- Baseline trackers (kept; mostly relevant for pitch) ---
+    // baselines (mainly helpful for pitch drift)
     track_baseline(cvTimbre, cv_timbre_base);
     track_baseline(cvVoct,   cv_voct_base);
     track_baseline(cvMorph,  cv_morph_base);
 
-    // --- Attenuverters (stretch then bipolar) ---
-    float avTimbre = uni_to_bi(stretch01(at_timbre, kMuxLo, kMuxHi)); // −1..+1
+    // attenuverters → bipolar
+    float avTimbre = uni_to_bi(stretch01(at_timbre, kMuxLo, kMuxHi));
     float avPitch  = uni_to_bi(stretch01(at_pitch,  kMuxLo, kMuxHi));
     float avSpread = uni_to_bi(stretch01(at_spread, kMuxLo, kMuxHi));
     float avMorph  = uni_to_bi(stretch01(at_morph,  kMuxLo, kMuxHi));
 
-    // Pitch (unchanged feel; deviations vs baseline)
+    // pitch
     const float pitch01 = clamp01(basePitch + avPitch * (cvVoct - cv_voct_base));
     const float baseHz  = 50.f + pitch01 * 1950.f;
 
-    // ---- Bipolar deltas for full throw on TIMBRE/MORPH/SPREAD ----
-    const float dMorph   = (cvMorph  - 0.5f) * 2.0f;   // −1..+1 for ±5V
-    const float dTimbre  = (cvTimbre - 0.5f) * 2.0f;   // −1..+1
-    const float dSpread  = (cvSpread - 0.5f) * 2.0f;   // −1..+1
+    // bipolar deltas for full throw
+    const float dMorph   = (cvMorph  - 0.5f) * 2.0f;
+    const float dTimbre  = (cvTimbre - 0.5f) * 2.0f;
+    const float dSpread  = (cvSpread - 0.5f) * 2.0f;
 
     const float morph    = clamp01(baseMorph  + avMorph  * dMorph);
     const float timbre   = clamp01(baseTimbre + avTimbre * dTimbre);
 
-    // Spread (swarm) with smoothing, now bipolar-full-range
+    // Spread with smoothing
     const float spread_target = clamp01(baseSpreadK + avSpread * dSpread);
     spread_smooth += spread_alpha * (spread_target - spread_smooth);
     const float spread = spread_smooth;
 
-    // ----- Heavy-guard detection -----
+    // Heavy-guard
     const bool heavy_guard = (spread > kHG_SpreadTh) && (morph > kHG_MorphTh) && (timbre > kHG_TimbreTh);
 
-    // Map Spread → fractional voices (gentle curve)
-    const float voices_f     = 1.0f + powf(spread, kSpreadCurveExp) * (float)(kMaxVoices - 1); // 1..kMaxVoices
-    const int   v_int        = (int)voices_f;         // floor
-    const float v_frac       = voices_f - (float)v_int; // 0..1 fade for the next voice
-    // Heavy-guard disables the "+1 fading" extra voice at the very top
+    // Voices
+    const float voices_f     = 1.0f + powf(spread, kSpreadCurveExp) * (float)(kMaxVoices - 1);
+    const int   v_int        = (int)voices_f;
+    const float v_frac       = voices_f - (float)v_int;
     const int   voices_used  = v_int + ((v_int < kMaxVoices && !heavy_guard) ? 1 : 0);
     const float detune_cents = spread * kDetuneMaxCents;
 
-    // Precompute detune factors and per-voice weights
+    // Detune/weights
     float detune_factor[kMaxVoices];
     float vweight[kMaxVoices];
-    float wsum = 0.0f;
-
+    float wsum = 0.f;
     for(int v = 0; v < voices_used; ++v)
     {
         float rel = (voices_used == 1) ? 0.f : (-1.f + 2.f * (float)v / (float)(voices_used - 1));
-        float shaped = copysignf(powf(fabsf(rel), 0.75f), rel); // pull inner voices closer
+        float shaped = copysignf(powf(fabsf(rel), 0.75f), rel);
         float cents  = shaped * detune_cents;
         detune_factor[v] = powf(2.f, cents / 1200.f);
-
-        float w = (v < v_int) ? 1.0f : v_frac; // last voice fades in (unless heavy_guard)
-        vweight[v] = w;
-        wsum += w;
+        float w = (v < v_int) ? 1.0f : v_frac;
+        vweight[v] = w; wsum += w;
     }
-    if(wsum <= 0.f) wsum = 1.f; // safety
+    if(wsum <= 0.f) wsum = 1.f;
 
-    // ---- Additive harmonic budget (once per block) ----
+    // Additive budget
     int add_budget = 2 + (int)floorf((1.0f - clamp01(spread)) * (float)(kAddMaxHarm - 2));
     if(add_budget < 1) add_budget = 1;
-    if(heavy_guard) add_budget = 1; // ultra-light in the heaviest corner
+    if(heavy_guard) add_budget = 1;
 
-    // --- Per-sample synthesis + AGC + follower (DAC write after block) ---
+    // ===== Per-sample synthesis =====
     for(size_t i = 0; i < n; ++i)
     {
+        // --- HARD SYNC (GPIO, active-low) ---
+        bool pin_high = sync_in.Read();                        // true = logic HIGH at pin
+        bool sync_now = SYNC_ACTIVE_LOW ? !pin_high : pin_high;
+        bool edge     = SYNC_ACTIVE_LOW ? (sync_prev && !sync_now)
+                                        : (!sync_prev && sync_now);
+        sync_prev = sync_now;
+        if(edge)
+        {
+            // Reset every oscillator phase right at this sample
+            for(int v = 0; v < kMaxVoices; ++v) phases[v] = 0.0f;
+        }
+
         // --- Osc block (pre-gain) ---
         float mix = 0.f;
         const float inc_base = baseHz / sr;
-
         for(int v = 0; v < voices_used; ++v)
         {
             float inc = inc_base * detune_factor[v];
             phases[v] += inc;
             if(phases[v] >= 1.f) phases[v] -= 1.f;
-
             float sig = wave_morph_extended(phases[v], morph, timbre, inc, add_budget);
             mix += vweight[v] * sig;
         }
-        // Normalize by sum of weights (keeps loudness stable as voices fade in/out)
         mix *= (1.0f / wsum);
 
         // --- PRE-gain RMS follower for AGC ---
@@ -387,13 +368,11 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         pre_env2 += pre_coef * (m2 - pre_env2);
         float pre_rms = sqrtf(pre_env2) + 1e-6f;
 
-        // AGC desired gain
         float desired_gain = kAgcTargetRms / pre_rms;
         if(desired_gain < kAgcMin) desired_gain = kAgcMin;
         if(desired_gain > kAgcMax) desired_gain = kAgcMax;
         agc_gain += kAgcSlew * (desired_gain - agc_gain);
 
-        // Apply base cap and AGC
         float y = kOutputLimit * agc_gain * mix;
         if(y > 1.f)  y = 1.f;
         if(y < -1.f) y = -1.f;
@@ -401,21 +380,20 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         out[0][i] = y;
         out[1][i] = y;
 
-        // --- POST-gain RMS follower (keep running; write DAC after block) ---
+        // --- POST-gain follower (for LED/AUX) ---
         float y2   = y * y;
         float coef = (y2 > env2) ? env_atk2 : env_rel2;
         env2 += coef * (y2 - env2);
     }
 
-    // ---- One DAC write per block (keeps CPU safe at extreme Spread) ----
+    // ---- One DAC write per block (LED/AUX env) ----
     float env_lin   = sqrtf(env2);
     float spread_boost = 0.9f + 0.2f * spread; // 0.9..1.1
     float env_shaped  = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
     if(env_shaped > 1.f) env_shaped = 1.f;
 
     uint16_t aux_val = (uint16_t)(env_shaped * 4095.f);
-    uint16_t led_val = aux_val;
-    if(kLedInvert) led_val = 4095 - led_val;
+    uint16_t led_val = kLedInvert ? (uint16_t)(4095 - aux_val) : aux_val;
 
     dac.WriteValue(AUX_DAC_CHANNEL, aux_val);
     dac.WriteValue(LED_DAC_CHANNEL, led_val);
@@ -428,19 +406,15 @@ int main(void)
     hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     hw.SetAudioBlockSize(48);
 
-    // ----- ADC setup (mapping unchanged) -----
+    // ----- ADC setup (4 direct + 2 mux) -----
     adc_cfg[CV_TIMBRE].InitSingle(A0);
     adc_cfg[CV_VOCT  ].InitSingle(A1);
     adc_cfg[CV_SPREAD].InitSingle(A2);
     adc_cfg[CV_MORPH ].InitSingle(A3);
-    adc_cfg[CV_SSYNC ].InitSingle(A4);
+    adc_cfg[4].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2); // pots
+    adc_cfg[5].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2); // attenuverters
 
-    // MUX1 pots
-    adc_cfg[5].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2);
-    // MUX2 attenuverters
-    adc_cfg[6].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2);
-
-    hw.adc.Init(adc_cfg, 7);
+    hw.adc.Init(adc_cfg, 6);
     hw.adc.Start();
 
     // ----- DAC setup -----
@@ -450,6 +424,10 @@ int main(void)
     dcfg.mode       = DacHandle::Mode::POLLING;
     dcfg.chn        = DacHandle::Channel::BOTH; // A8 (CH1) + A7 (CH2)
     dac.Init(dcfg);
+
+    // ----- SSYNC GPIO (active-low) -----
+    sync_in.Init(SYNC_PIN, GPIO::Mode::INPUT, GPIO::Pull::NOPULL);
+    sync_prev = true; // idle high for active-low
 
     const float sr = hw.AudioSampleRate();
 
@@ -474,19 +452,18 @@ int main(void)
         cv_voct_raw   = hw.adc.GetFloat(CV_VOCT);
         cv_spread_raw = hw.adc.GetFloat(CV_SPREAD);
         cv_morph_raw  = hw.adc.GetFloat(CV_MORPH);
-        cv_ssync_raw  = hw.adc.GetFloat(CV_SSYNC); // unused for now
 
         // MUX1 (pots)
-        kPitch  = hw.adc.GetMuxFloat(5, CH_PITCH);
-        kMorph  = hw.adc.GetMuxFloat(5, CH_MORPH);
-        kSpread = hw.adc.GetMuxFloat(5, CH_SPREAD);
-        kTimbre = hw.adc.GetMuxFloat(5, CH_TIMBRE);
+        kPitch  = hw.adc.GetMuxFloat(4, CH_PITCH);
+        kMorph  = hw.adc.GetMuxFloat(4, CH_MORPH);
+        kSpread = hw.adc.GetMuxFloat(4, CH_SPREAD);
+        kTimbre = hw.adc.GetMuxFloat(4, CH_TIMBRE);
 
         // MUX2 (attenuverters)
-        at_timbre = hw.adc.GetMuxFloat(6, AT_CH_TIMBRE);
-        at_pitch  = hw.adc.GetMuxFloat(6, AT_CH_PITCH);
-        at_spread = hw.adc.GetMuxFloat(6, AT_CH_SPREAD);
-        at_morph  = hw.adc.GetMuxFloat(6, AT_CH_MORPH);
+        at_timbre = hw.adc.GetMuxFloat(5, AT_CH_TIMBRE);
+        at_pitch  = hw.adc.GetMuxFloat(5, AT_CH_PITCH);
+        at_spread = hw.adc.GetMuxFloat(5, AT_CH_SPREAD);
+        at_morph  = hw.adc.GetMuxFloat(5, AT_CH_MORPH);
 
         System::Delay(1);
     }
