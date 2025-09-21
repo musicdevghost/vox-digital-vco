@@ -1,8 +1,7 @@
-// Vox — Extended Morph + Tamed Spread + Heavy-Guard for worst-case combo
-// • Heavy-guard triggers ONLY when Spread, Morph, and Timbre are all near max:
-//      Spread>~0.85, Morph>~0.80, Timbre>~0.60
-//   Then it (a) disables the "+1 fading" extra voice and (b) trims additive harmonics.
-// • Everything else unchanged: mappings, AGC, env follower, BLEP square, saw multiply.
+// Vox — Extended Morph + Tamed Spread + CV full-range stretch for ±5V LFOs
+// • NEW: CV/AT stretch so ±5V fully reaches modulation range on TIMBRE/MORPH/SPREAD.
+// • Bipolar deltas: d = (cv - 0.5) * 2, then scaled by attenuverter (−1..+1).
+// • Pitch path unchanged (keeps your feel). Heavy-guard & per-block DAC writes kept.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -42,10 +41,16 @@ static constexpr int   kAddMaxHarm       = 8;      // absolute cap
 static constexpr int   kMaxVoices        = 5;      // hard cap voices
 static constexpr float kDetuneMaxCents   = 30.0f;  // max spread detune
 
-// ===== Heavy-guard thresholds (NEW) =====
+// ===== Heavy-guard thresholds =====
 static constexpr float kHG_SpreadTh      = 0.85f;
 static constexpr float kHG_MorphTh       = 0.80f;
 static constexpr float kHG_TimbreTh      = 0.60f;
+
+// ===== CV/AT stretch (compensate 4051/ADC rails) =====
+static constexpr float kCvLo             = 0.03f;  // direct CVs often read ~0.03..0.97
+static constexpr float kCvHi             = 0.97f;
+static constexpr float kMuxLo            = 0.04f;  // attenuverters over MUX2 ~0.04..0.96
+static constexpr float kMuxHi            = 0.96f;
 
 // ======================= Pins / Mapping ===================
 #define MUX1_COM_PIN  A5
@@ -101,7 +106,7 @@ static float at_pitch  = 0.f; // idx 1
 static float at_spread = 0.f; // idx 2
 static float at_morph  = 0.f; // idx 3
 
-// Baselines for CVs that use deviation
+// Baselines (kept only for pitch & minor drift control if needed)
 static float cv_timbre_base = 0.5f;
 static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
@@ -131,6 +136,7 @@ static inline float apply_uni(float cv01, float pol){ return (pol >= 0.f) ? cv01
 static inline float uni_to_bi(float u){ return (u * 2.f) - 1.f; }
 static inline void  track_baseline(float in01, float &base, float alpha = 0.0005f){ base += alpha * (in01 - base); }
 static inline float smoothstep01(float t){ t = clamp01(t); return t * t * (3.f - 2.f * t); }
+static inline float stretch01(float x, float lo, float hi){ return clamp01((x - lo) / (hi - lo)); }
 
 // Basic waves
 static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
@@ -198,7 +204,7 @@ static inline float wave_saw_multiply(float ph, float mult_amt)
     return 2.f * ph2 - 1.f;
 }
 
-// ===== Additive sine stack with external budget (HEAVY-GUARD AWARE) =====
+// ===== Additive sine stack with external budget =====
 static inline float sine_additive_budgeted(float ph, float amt, float dt, int kmax)
 {
     amt = clamp01(amt);
@@ -282,31 +288,43 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float baseSpreadK = kSpread;                   // 0..1
     const float baseTimbre  = kTimbre;                   // 0..1
 
-    const float cvTimbre = apply_uni(cv_timbre_raw, CV_POL_TIMBRE);
-    const float cvVoct   = apply_uni(cv_voct_raw,   CV_POL_VOCT);
-    const float cvSpread = apply_uni(cv_spread_raw, CV_POL_SPREAD);
-    const float cvMorph  = apply_uni(cv_morph_raw,  CV_POL_MORPH);
+    // --- Raw CVs ---
+    float cvTimbre_raw = apply_uni(::cv_timbre_raw, CV_POL_TIMBRE);
+    float cvVoct_raw   = apply_uni(::cv_voct_raw,   CV_POL_VOCT);
+    float cvSpread_raw = apply_uni(::cv_spread_raw, CV_POL_SPREAD);
+    float cvMorph_raw  = apply_uni(::cv_morph_raw,  CV_POL_MORPH);
 
-    // update baselines for deviation-based CVs
+    // --- Stretch CVs to use full range (compensate 0.03..0.97) ---
+    const float cvTimbre = stretch01(cvTimbre_raw, kCvLo, kCvHi);
+    const float cvVoct   = stretch01(cvVoct_raw,   kCvLo, kCvHi);
+    const float cvSpread = stretch01(cvSpread_raw, kCvLo, kCvHi);
+    const float cvMorph  = stretch01(cvMorph_raw,  kCvLo, kCvHi);
+
+    // --- Baseline trackers (kept; mostly relevant for pitch) ---
     track_baseline(cvTimbre, cv_timbre_base);
     track_baseline(cvVoct,   cv_voct_base);
     track_baseline(cvMorph,  cv_morph_base);
 
-    const float avTimbre = uni_to_bi(at_timbre);
-    const float avPitch  = uni_to_bi(at_pitch);
-    const float avSpread = uni_to_bi(at_spread);
-    const float avMorph  = uni_to_bi(at_morph);
+    // --- Attenuverters (stretch then bipolar) ---
+    float avTimbre = uni_to_bi(stretch01(at_timbre, kMuxLo, kMuxHi)); // −1..+1
+    float avPitch  = uni_to_bi(stretch01(at_pitch,  kMuxLo, kMuxHi));
+    float avSpread = uni_to_bi(stretch01(at_spread, kMuxLo, kMuxHi));
+    float avMorph  = uni_to_bi(stretch01(at_morph,  kMuxLo, kMuxHi));
 
-    // Pitch
+    // Pitch (unchanged feel; deviations vs baseline)
     const float pitch01 = clamp01(basePitch + avPitch * (cvVoct - cv_voct_base));
     const float baseHz  = 50.f + pitch01 * 1950.f;
 
-    // Morph & Timbre
-    const float morph   = clamp01(baseMorph + avMorph  * (cvMorph - cv_morph_base));
-    const float timbre  = clamp01(baseTimbre + avTimbre * (cvTimbre - cv_timbre_base));
+    // ---- Bipolar deltas for full throw on TIMBRE/MORPH/SPREAD ----
+    const float dMorph   = (cvMorph  - 0.5f) * 2.0f;   // −1..+1 for ±5V
+    const float dTimbre  = (cvTimbre - 0.5f) * 2.0f;   // −1..+1
+    const float dSpread  = (cvSpread - 0.5f) * 2.0f;   // −1..+1
 
-    // Spread (classic attenuverter + smoothing)
-    const float spread_target = clamp01(baseSpreadK + avSpread * (cvSpread - 0.5f));
+    const float morph    = clamp01(baseMorph  + avMorph  * dMorph);
+    const float timbre   = clamp01(baseTimbre + avTimbre * dTimbre);
+
+    // Spread (swarm) with smoothing, now bipolar-full-range
+    const float spread_target = clamp01(baseSpreadK + avSpread * dSpread);
     spread_smooth += spread_alpha * (spread_target - spread_smooth);
     const float spread = spread_smooth;
 
@@ -340,7 +358,6 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     if(wsum <= 0.f) wsum = 1.f; // safety
 
     // ---- Additive harmonic budget (once per block) ----
-    // Base budget: more Spread → smaller budget; Heavy-guard → minimal budget.
     int add_budget = 2 + (int)floorf((1.0f - clamp01(spread)) * (float)(kAddMaxHarm - 2));
     if(add_budget < 1) add_budget = 1;
     if(heavy_guard) add_budget = 1; // ultra-light in the heaviest corner
