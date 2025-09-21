@@ -1,6 +1,8 @@
-// Vox — Buchla-ish fold with reduced range
-// • Fold range tightened: subtle at low Timbre, capped max (≈2 stages, gentler drive/sat/enh)
-// • All else unchanged (mappings, Spread/unison, AGC, LED=AUX env follower, PWM polyBLEP, saw multiply)
+// Vox — Extended Morph + Tamed Spread + Heavy-Guard for worst-case combo
+// • Heavy-guard triggers ONLY when Spread, Morph, and Timbre are all near max:
+//      Spread>~0.85, Morph>~0.80, Timbre>~0.60
+//   Then it (a) disables the "+1 fading" extra voice and (b) trims additive harmonics.
+// • Everything else unchanged: mappings, AGC, env follower, BLEP square, saw multiply.
 
 #include "daisy_seed.h"
 #include <cmath>
@@ -11,26 +13,39 @@ using namespace daisy::seed;
 DaisySeed hw;
 
 // ======================= Tunables =========================
-static constexpr float kOutputLimit   = 0.40f; // master output cap (unchanged)
-static constexpr float kSpreadTauSec  = 0.030f; // Spread smoothing (~30 ms)
+static constexpr float kOutputLimit      = 0.40f; // master output cap
+static constexpr float kSpreadTauSec     = 0.030f; // Spread smoothing (~30 ms)
+static constexpr float kSpreadCurveExp   = 1.60f;  // >1 = gentler near max
 
 // Envelope follower feel (LED & AUX)
-static constexpr float kEnvAtkMs      = 6.0f;
-static constexpr float kEnvRelMs      = 140.0f;
-static constexpr float kEnvGain       = 1.6f;
-static constexpr float kEnvGamma      = 0.65f;
+static constexpr float kEnvAtkMs         = 6.0f;
+static constexpr float kEnvRelMs         = 140.0f;
+static constexpr float kEnvGain          = 1.6f;
+static constexpr float kEnvGamma         = 0.65f;
 
 // LED behavior
-static constexpr bool  kLedInvert     = true;   // invert if LED is current-sink
-
-// ===== Fold range scaler (NEW): lower → gentler overall max =====
-static constexpr float kFoldRange     = 0.60f;  // 0..1. Try 0.50–0.70 to taste.
+static constexpr bool  kLedInvert        = true;   // invert if LED is current-sink
 
 // ======================= AGC Tunables =====================
-static constexpr float kAgcMin        = 0.5f;
-static constexpr float kAgcMax        = 2.0f;
-static constexpr float kAgcTargetRms  = 0.35f;
-static constexpr float kAgcSlew       = 0.0025f;
+static constexpr float kAgcMin           = 0.5f;
+static constexpr float kAgcMax           = 2.0f;
+static constexpr float kAgcTargetRms     = 0.35f;
+static constexpr float kAgcSlew          = 0.0025f;
+
+// ===== Fold range scaler (your config) =====
+static constexpr float kFoldRange        = 0.60f;
+
+// ===== Additive cap (your config) =====
+static constexpr int   kAddMaxHarm       = 8;      // absolute cap
+
+// ===== Unison limits (your config + gentle curve) =====
+static constexpr int   kMaxVoices        = 5;      // hard cap voices
+static constexpr float kDetuneMaxCents   = 30.0f;  // max spread detune
+
+// ===== Heavy-guard thresholds (NEW) =====
+static constexpr float kHG_SpreadTh      = 0.85f;
+static constexpr float kHG_MorphTh       = 0.80f;
+static constexpr float kHG_TimbreTh      = 0.60f;
 
 // ======================= Pins / Mapping ===================
 #define MUX1_COM_PIN  A5
@@ -39,9 +54,9 @@ static constexpr float kAgcSlew       = 0.0025f;
 #define MUX1_SEL2     D7
 
 #define CH_PITCH   0  // KNOB 0
-#define CH_MORPH   1  // KNOB 1  -> shape morph
+#define CH_MORPH   1  // KNOB 1  -> extended morph
 #define CH_SPREAD  2  // KNOB 2  -> swarm
-#define CH_TIMBRE  3  // KNOB 3  -> per-shape modulation
+#define CH_TIMBRE  3  // KNOB 3  -> fold depth / harmonic amount
 
 #define MUX2_COM_PIN  A6
 #define MUX2_SEL0     D1
@@ -76,9 +91,9 @@ static float cv_ssync_raw  = 0.f; // A4 (unused for now)
 
 // Pots via MUX1
 static float kPitch  = 0.f; // pitch
-static float kMorph  = 0.f; // shape morph  (0..1)
-static float kSpread = 0.f; // swarm amount (0..1)
-static float kTimbre = 0.f; // modulation   (0..1)
+static float kMorph  = 0.f; // extended morph  (0..1)
+static float kSpread = 0.f; // swarm amount    (0..1)
+static float kTimbre = 0.f; // fold depth / harmonic amount (0..1)
 
 // Attenuverters via MUX2 (0..1 → -1..+1)
 static float at_timbre = 0.f; // idx 0
@@ -92,7 +107,6 @@ static float cv_voct_base   = 0.5f;
 static float cv_morph_base  = 0.5f;
 
 // DSP state
-static constexpr int kMaxVoices = 7;
 static float phases[kMaxVoices] = {0};
 
 // ---- Envelope followers ----
@@ -113,9 +127,10 @@ static float spread_alpha  = 0.f;
 // ======================= Helpers ==========================
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float lerp(float a, float b, float t){ return a + t * (b - a); }
-static inline float apply_uni(float cv01, float pol){ return pol >= 0.f ? cv01 : (1.f - cv01); }
+static inline float apply_uni(float cv01, float pol){ return (pol >= 0.f) ? cv01 : (1.f - cv01); }
 static inline float uni_to_bi(float u){ return (u * 2.f) - 1.f; }
 static inline void  track_baseline(float in01, float &base, float alpha = 0.0005f){ base += alpha * (in01 - base); }
+static inline float smoothstep01(float t){ t = clamp01(t); return t * t * (3.f - 2.f * t); }
 
 // Basic waves
 static inline float wave_sine(float ph)   { return sinf(2.f * M_PI * ph); }
@@ -124,16 +139,8 @@ static inline float wave_tri(float ph)    { return 1.f - 4.f * fabsf(ph - 0.5f);
 // ---- polyBLEP for band-limited transitions ----
 static inline float poly_blep(float t, float dt)
 {
-    if(t < dt)
-    {
-        t /= dt;
-        return t + t - t * t - 1.0f;
-    }
-    else if(t > 1.0f - dt)
-    {
-        t = (t - 1.0f) / dt;
-        return t * t + t + t + 1.0f;
-    }
+    if(t < dt)           { t /= dt; return t + t - t * t - 1.0f; }
+    else if(t > 1.f-dt)  { t = (t - 1.f) / dt; return t * t + t + t + 1.0f; }
     return 0.0f;
 }
 
@@ -145,28 +152,15 @@ static inline float wave_square_pwm_blep(float ph, float duty, float dt)
     if(duty > 0.95f) duty = 0.95f;
 
     float y = (ph < duty) ? 1.0f : -1.0f;
-
-    // upward step at ph = 0.0
     y -= poly_blep(ph, dt);
-    // downward step at ph = duty
-    float tt = ph - duty;
-    if(tt < 0.f) tt += 1.f;
+    float tt = ph - duty; if(tt < 0.f) tt += 1.f;
     y += poly_blep(tt, dt);
-
     return y;
 }
 
 // ===== Wavefolder: Buchla-ish multi-stage triangle wrap + soft saturation =====
-// Range reduced & tapered for finer control.
-//   • amt' = pow( clamp(amt * kFoldRange), 1.25 )   → gentle near 0, capped max
-//   • drive  : 1 .. 9
-//   • stages : 1 .. 2
-//   • bias   : up to ~0.10 (gentle asymmetry)
-//   • sat    : subtle, 0.9 .. 1.1
-//   • enh_mix: up to ~0.12 (digital spice)
 static inline float tri_wrap_core(float x)
 {
-    // Map any x to a centered triangle in [-1,1]
     float u     = x * 0.5f + 0.5f;           // -1..1 -> 0..1
     float m     = u - floorf(u);             // fract
     float tri01 = 1.f - fabsf(m * 2.f - 1.f);
@@ -175,25 +169,23 @@ static inline float tri_wrap_core(float x)
 
 static inline float buchlaish_fold(float x, float amt)
 {
-    // Taper & cap the effective amount
     float a = clamp01(amt * kFoldRange);
-    a = powf(a, 1.25f);                      // finer low-end control
+    a = powf(a, 1.25f);
 
     float drive  = 1.0f + 8.0f * a;          // 1..9
-    int   stages = 1 + (int)floorf(a * 1.9f); // 1..2
-    float bias   = 0.10f * a;                // gentle asymmetry
-    float sat    = 0.9f  + 0.20f * a;        // mild tanh strength
+    int   stages = 1 + (int)floorf(a * 1.9f);// 1..2
+    float bias   = 0.10f * a;
+    float sat    = 0.9f  + 0.20f * a;
 
     float y = x;
     for(int s = 0; s < stages; ++s)
     {
-        float b = ((s & 1) ? -1.f : 1.f) * bias; // alternate the bias per stage
+        float b = ((s & 1) ? -1.f : 1.f) * bias;
         y = tri_wrap_core((y + b) * drive);
         y = tanhf(y * sat);
     }
 
-    // Subtle digital enhancement (reduced range)
-    float enh_mix = 0.12f * a;               // up to 12%
+    float enh_mix = 0.12f * a;
     float enh     = sinf((2.0f + 4.0f * a) * 0.5f * M_PI * y);
     return lerp(y, 0.7f * y + 0.3f * enh, enh_mix);
 }
@@ -206,25 +198,77 @@ static inline float wave_saw_multiply(float ph, float mult_amt)
     return 2.f * ph2 - 1.f;
 }
 
-// Morph engine with per-shape modulation (fold uses buchlaish_fold)
-static inline float wave_morph_with_timbre(float ph, float morph01, float timbre01, float dt)
+// ===== Additive sine stack with external budget (HEAVY-GUARD AWARE) =====
+static inline float sine_additive_budgeted(float ph, float amt, float dt, int kmax)
+{
+    amt = clamp01(amt);
+    if(amt <= 1e-4f || kmax < 1) return 0.f;
+
+    // Nyquist safety
+    int nyq = (int)fminf((0.49f / fmaxf(dt, 1e-6f)), (float)kmax);
+    if(nyq < 1) return 0.f;
+
+    // Brighter spectrum at high amt
+    float p = 1.1f - 0.5f * amt;           // exponent for 1/k^p (1.1 → 0.6)
+    float odd_bias = 0.6f + 0.4f * amt;    // emphasize odds as amt rises
+
+    float acc = 0.f, norm = 0.f;
+    for(int k = 2; k <= nyq + 1; ++k)      // start at 2nd harmonic
+    {
+        float w = powf((float)k, -p);
+        float ob = (k % 2) ? odd_bias : (1.0f - 0.5f * amt);
+        w *= (0.7f + 0.3f * ob);
+        norm += w;
+
+        float pk = ph * (float)k; pk -= floorf(pk);
+        acc += w * sinf(2.f * M_PI * pk);
+    }
+    if(norm > 1e-6f) acc /= norm;
+
+    float mix = 0.25f + 0.75f * amt;       // stronger high-end
+    return mix * acc;
+}
+
+// ===== Extended Morph path (6 nodes) =====
+// nodes: 0: sine(fold)  1: tri(fold)  2: saw(multiply)  3: square(PWM)
+//        4: tri(fold)   5: sine(additive)
+static inline float wave_node(int node, float ph, float timbre, float dt, int add_budget)
+{
+    switch(node)
+    {
+        case 0: return buchlaish_fold(wave_sine(ph), timbre);                 // folded sine
+        case 1: return buchlaish_fold(wave_tri(ph),  timbre);                 // folded tri
+        case 2: return wave_saw_multiply(ph, timbre);                         // multiply saw
+        case 3: { // PWM square (polyBLEP), timbre -> duty
+            float duty = 0.5f + 0.45f * (timbre - 0.5f) * 2.f;                // ~5..95%
+            return wave_square_pwm_blep(ph, duty, dt);
+        }
+        case 4: return buchlaish_fold(wave_tri(ph),  0.6f * timbre);          // tri again, gentler fold
+        default:
+        case 5: { // sine + additive (budgeted)
+            float base = wave_sine(ph);
+            float add  = sine_additive_budgeted(ph, timbre, dt, add_budget);
+            float y    = base + add;
+            return tanhf(0.95f * y); // mild safety
+        }
+    }
+}
+
+static inline float wave_morph_extended(float ph, float morph01, float timbre01, float dt, int add_budget)
 {
     morph01  = clamp01(morph01);
     timbre01 = clamp01(timbre01);
 
-    float s_sin = buchlaish_fold(wave_sine(ph), timbre01);
-    float s_tri = buchlaish_fold(wave_tri(ph),  timbre01);
-    float s_saw = wave_saw_multiply(ph,   timbre01);           // multiply
-    float duty  = 0.5f + 0.45f * (timbre01 - 0.5f) * 2.f;      // ~5..95%
-    float s_sqr = wave_square_pwm_blep(ph, duty, dt);          // PWM (polyBLEP)
+    // 6 nodes → 5 segments
+    float idx = morph01 * 5.f;     // seg index 0..5
+    int   seg = (int)idx;          // 0..4
+    if(seg > 4) seg = 4;
+    float t   = idx - (float)seg;  // 0..1 within segment
+    float ts  = smoothstep01(t);   // smoother crossfade
 
-    float idx = morph01 * 3.f;
-    int   seg = (int)idx;                 // 0,1,2
-    float t   = idx - float(seg);         // 0..1
-
-    if(seg == 0) return lerp(s_sin, s_tri, t);
-    if(seg == 1) return lerp(s_tri, s_saw, t);
-    /*seg==2*/   return lerp(s_saw, s_sqr, t);
+    float a = wave_node(seg,     ph, timbre01, dt, add_budget);
+    float b = wave_node(seg + 1, ph, timbre01, dt, add_budget);
+    return lerp(a, b, ts);
 }
 
 static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t n)
@@ -234,9 +278,9 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 
     // ---- Read/derive control values ----
     const float basePitch   = kPitch;                    // 0..1
-    const float baseMorph   = kMorph;                    // 0..1 shape crossfade
-    const float baseSpreadK = kSpread;                   // 0..1 swarm
-    const float baseTimbre  = kTimbre;                   // 0..1 per-shape modulation
+    const float baseMorph   = kMorph;                    // 0..1
+    const float baseSpreadK = kSpread;                   // 0..1
+    const float baseTimbre  = kTimbre;                   // 0..1
 
     const float cvTimbre = apply_uni(cv_timbre_raw, CV_POL_TIMBRE);
     const float cvVoct   = apply_uni(cv_voct_raw,   CV_POL_VOCT);
@@ -261,18 +305,21 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     const float morph   = clamp01(baseMorph + avMorph  * (cvMorph - cv_morph_base));
     const float timbre  = clamp01(baseTimbre + avTimbre * (cvTimbre - cv_timbre_base));
 
-    // Spread (swarm amount) classic attenuverter + smoothing
+    // Spread (classic attenuverter + smoothing)
     const float spread_target = clamp01(baseSpreadK + avSpread * (cvSpread - 0.5f));
     spread_smooth += spread_alpha * (spread_target - spread_smooth);
     const float spread = spread_smooth;
 
-    // Map Spread → fractional voices and detune
-    const float voices_f     = 1.0f + spread * 6.0f;  // 1..7 continuous
+    // ----- Heavy-guard detection -----
+    const bool heavy_guard = (spread > kHG_SpreadTh) && (morph > kHG_MorphTh) && (timbre > kHG_TimbreTh);
+
+    // Map Spread → fractional voices (gentle curve)
+    const float voices_f     = 1.0f + powf(spread, kSpreadCurveExp) * (float)(kMaxVoices - 1); // 1..kMaxVoices
     const int   v_int        = (int)voices_f;         // floor
     const float v_frac       = voices_f - (float)v_int; // 0..1 fade for the next voice
-    const int   voices_used  = v_int + (v_int < kMaxVoices ? 1 : 0); // include the fading-in one
-    const float max_cents    = 30.0f;
-    const float detune_cents = spread * max_cents;
+    // Heavy-guard disables the "+1 fading" extra voice at the very top
+    const int   voices_used  = v_int + ((v_int < kMaxVoices && !heavy_guard) ? 1 : 0);
+    const float detune_cents = spread * kDetuneMaxCents;
 
     // Precompute detune factors and per-voice weights
     float detune_factor[kMaxVoices];
@@ -286,13 +333,19 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         float cents  = shaped * detune_cents;
         detune_factor[v] = powf(2.f, cents / 1200.f);
 
-        float w = (v < v_int) ? 1.0f : v_frac;
+        float w = (v < v_int) ? 1.0f : v_frac; // last voice fades in (unless heavy_guard)
         vweight[v] = w;
         wsum += w;
     }
     if(wsum <= 0.f) wsum = 1.f; // safety
 
-    // Per-sample synthesis + AGC + followers
+    // ---- Additive harmonic budget (once per block) ----
+    // Base budget: more Spread → smaller budget; Heavy-guard → minimal budget.
+    int add_budget = 2 + (int)floorf((1.0f - clamp01(spread)) * (float)(kAddMaxHarm - 2));
+    if(add_budget < 1) add_budget = 1;
+    if(heavy_guard) add_budget = 1; // ultra-light in the heaviest corner
+
+    // --- Per-sample synthesis + AGC + follower (DAC write after block) ---
     for(size_t i = 0; i < n; ++i)
     {
         // --- Osc block (pre-gain) ---
@@ -305,9 +358,10 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
             phases[v] += inc;
             if(phases[v] >= 1.f) phases[v] -= 1.f;
 
-            float sig = wave_morph_with_timbre(phases[v], morph, timbre, inc);
+            float sig = wave_morph_extended(phases[v], morph, timbre, inc, add_budget);
             mix += vweight[v] * sig;
         }
+        // Normalize by sum of weights (keeps loudness stable as voices fade in/out)
         mix *= (1.0f / wsum);
 
         // --- PRE-gain RMS follower for AGC ---
@@ -330,24 +384,24 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         out[0][i] = y;
         out[1][i] = y;
 
-        // --- POST-gain RMS follower → LED/AUX ---
+        // --- POST-gain RMS follower (keep running; write DAC after block) ---
         float y2   = y * y;
         float coef = (y2 > env2) ? env_atk2 : env_rel2;
         env2 += coef * (y2 - env2);
-
-        float env_lin   = sqrtf(env2);
-        float spread_boost = 0.9f + 0.2f * spread; // 0.9..1.1
-        float env_shaped  = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
-        if(env_shaped > 1.f) env_shaped = 1.f;
-
-        // AUX/ENV (A8): 0..4095 → ~0..5V analog
-        dac.WriteValue(AUX_DAC_CHANNEL, (uint16_t)(env_shaped * 4095.f));
-
-        // LED (A7): same envelope (optionally inverted)
-        uint16_t led_dac = (uint16_t)(env_shaped * 4095.f);
-        if(kLedInvert) led_dac = 4095 - led_dac;
-        dac.WriteValue(LED_DAC_CHANNEL, led_dac);
     }
+
+    // ---- One DAC write per block (keeps CPU safe at extreme Spread) ----
+    float env_lin   = sqrtf(env2);
+    float spread_boost = 0.9f + 0.2f * spread; // 0.9..1.1
+    float env_shaped  = powf(clamp01(env_lin * kEnvGain * spread_boost), kEnvGamma);
+    if(env_shaped > 1.f) env_shaped = 1.f;
+
+    uint16_t aux_val = (uint16_t)(env_shaped * 4095.f);
+    uint16_t led_val = aux_val;
+    if(kLedInvert) led_val = 4095 - led_val;
+
+    dac.WriteValue(AUX_DAC_CHANNEL, aux_val);
+    dac.WriteValue(LED_DAC_CHANNEL, led_val);
 }
 
 int main(void)
