@@ -4,10 +4,12 @@
 // If your GATE_IN_1 is on D19 instead, change SYNC_PIN below to D19.
 
 #include "daisy_seed.h"
+#include "daisysp.h"
 #include <cmath>
 
 using namespace daisy;
 using namespace daisy::seed;
+using namespace daisysp;
 
 DaisySeed hw;
 
@@ -137,7 +139,18 @@ static float spread_smooth = 0.f;
 static float spread_alpha  = 0.f;
 
 // SSYNC edge tracking
-static bool sync_prev = true; // idle (high) for active-low
+static bool sync_prev = true;
+
+// DaisySP oscillator cores per voice
+static Oscillator osc_sin[kMaxVoices];
+static Oscillator osc_tri[kMaxVoices];
+static Oscillator osc_saw[kMaxVoices];
+static Oscillator osc_sqr[kMaxVoices];
+static Wavefolder folder_unit[kMaxVoices];
+// Use the same cap as kAddMaxHarm for template param
+template<int N> struct HarmWrap { using Type = HarmonicOscillator<N>; };
+static HarmonicOscillator<kAddMaxHarm> harm[kMaxVoices];
+ // idle (high) for active-low
 
 // ======================= Helpers ==========================
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
@@ -346,21 +359,99 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
         if(edge)
         {
             // Reset every oscillator phase right at this sample
-            for(int v = 0; v < kMaxVoices; ++v) phases[v] = 0.0f;
+            for(int v = 0; v < kMaxVoices; ++v) {
+            phases[v] = 0.0f; // legacy phase (not used by DaisySP path)
+            osc_sin[v].Reset(0.0f);
+            osc_tri[v].Reset(0.0f);
+            osc_saw[v].Reset(0.0f);
+            osc_sqr[v].Reset(0.0f);
+            // HarmonicOscillator has no Reset; resetting via phase is not exposed.
+            // Reset by briefly toggling freq (no-op) so it continues coherent with others.
+            harm[v].Init(sr);
+        }
         }
 
         // --- Osc block (pre-gain) ---
-        float mix = 0.f;
-        const float inc_base = baseHz / sr;
-        for(int v = 0; v < voices_used; ++v)
+// DaisySP implementation with morph sin→tri→saw→square→tri→sin and Timbre mapping
+float mix = 0.f;
+const float pwm = 0.5f + 0.45f * ((timbre - 0.5f) * 2.f); // for square region
+const float idx_m = morph * 5.f;
+int   seg_m = (int)idx_m; if(seg_m > 4) seg_m = 4;
+float t_m   = idx_m - (float)seg_m;
+float ts_m  = smoothstep01(t_m);
+
+// Configure additive amplitudes for "bright" end once per block
+float add_amps[kAddMaxHarm];
+for(int k = 0; k < kAddMaxHarm; ++k) add_amps[k] = 0.0f;
+// k=0 unused by module; k=1 is fundamental (we'll keep it 0 since we add base sine separately)
+// Budget a few upper partials according to add_budget and timbre; gentle 1/k rolloff
+for(int k = 2; k < kAddMaxHarm && k <= add_budget; ++k)
+{
+    float a = (timbre) * (0.5f / (float)k);
+    add_amps[k] = a;
+}
+
+for(int v = 0; v < voices_used; ++v)
+{
+    const float f = baseHz * detune_factor[v];
+    // Set frequency per voice
+    osc_sin[v].SetFreq(f);
+    osc_tri[v].SetFreq(f);
+    osc_saw[v].SetFreq(f);
+    osc_sqr[v].SetFreq(f);
+    harm[v].SetFreq(f);
+    harm[v].SetAmplitudes(add_amps);
+
+    // keep PWM updated (only affects square)
+    osc_sqr[v].SetPw(pwm);
+
+    // Get node outputs
+    auto node_out = [&](int node)->float {
+        switch(node)
         {
-            float inc = inc_base * detune_factor[v];
-            phases[v] += inc;
-            if(phases[v] >= 1.f) phases[v] -= 1.f;
-            float sig = wave_morph_extended(phases[v], morph, timbre, inc, add_budget);
-            mix += vweight[v] * sig;
+            case 0: {
+                float s = osc_sin[v].Process();
+                // Fold intensity via input gain
+                folder_unit[v].SetGain(1.0f + kFoldRange * timbre);
+                return folder_unit[v].Process(s);
+            }
+            case 1: {
+                float s = osc_tri[v].Process();
+                folder_unit[v].SetGain(1.0f + kFoldRange * timbre);
+                return folder_unit[v].Process(s);
+            }
+            case 2: {
+                float s = osc_saw[v].Process();
+                // Simple brightening: mild drive that increases with timbre
+                float driven = tanhf((1.0f + 0.8f * timbre) * s);
+                return driven;
+            }
+            case 3: {
+                return osc_sqr[v].Process();
+            }
+            case 4: {
+                float s = osc_tri[v].Process();
+                folder_unit[v].SetGain(1.0f + 0.6f * kFoldRange * timbre);
+                return folder_unit[v].Process(s);
+            }
+            default:
+            case 5: {
+                float base = osc_sin[v].Process();
+                float add  = harm[v].Process();
+                // Gentle limiting like original
+                return tanhf(0.95f * (base + add));
+            }
         }
-        mix *= (1.0f / wsum);
+    };
+
+    float a = node_out(seg_m);
+    float b = node_out(seg_m + 1);
+    float sig = lerp(a, b, ts_m);
+
+    mix += vweight[v] * sig;
+}
+mix *= (1.0f / wsum);
+
 
         // --- PRE-gain RMS follower for AGC ---
         float m2 = mix * mix;
@@ -441,6 +532,38 @@ int main(void)
 
     // Spread smoothing coefficient
     spread_alpha = 1.0f / (kSpreadTauSec * sr);
+
+    // DaisySP oscillator init
+    for(int v = 0; v < kMaxVoices; ++v)
+    {
+        osc_sin[v].Init(sr);
+        osc_sin[v].SetWaveform(Oscillator::WAVE_SIN);
+        osc_sin[v].SetAmp(1.0f);
+
+        osc_tri[v].Init(sr);
+        osc_tri[v].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);
+        osc_tri[v].SetAmp(1.0f);
+
+        osc_saw[v].Init(sr);
+        osc_saw[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
+        osc_saw[v].SetAmp(1.0f);
+
+        osc_sqr[v].Init(sr);
+        osc_sqr[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
+        osc_sqr[v].SetAmp(1.0f);
+        osc_sqr[v].SetPw(0.5f);
+
+        folder_unit[v].Init();
+        folder_unit[v].SetGain(1.0f);
+        folder_unit[v].SetOffset(0.0f);
+
+        harm[v].Init(sr);
+        harm[v].SetFirstHarmIdx(1); // fundamental at index 1
+        // Default amplitudes all zeros
+        float amps[kAddMaxHarm] = {0};
+        harm[v].SetAmplitudes(amps);
+    }
+
 
     hw.StartAudio(AudioCb);
 
