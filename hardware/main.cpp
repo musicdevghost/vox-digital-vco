@@ -15,7 +15,11 @@ DaisySeed hw;
 
 // ======================= Tunables =========================
 static constexpr float kOutputLimit      = 0.40f; // master output cap
-static constexpr float kSpreadTauSec     = 0.030f; // Spread smoothing (~30 ms)
+static constexpr float kSpreadTauSec     = 0.002f; // faster spread smoothing (~2ms) // Spread
+static constexpr int   kSyncBlankSamples = 2;      // ignore edges for a few samples after a reset
+static constexpr float kVoctBaselineAlpha= 0.0f;   // 0 = off (no pitch slew)
+static constexpr float kParamDezipperHz  = 1000.f; // one-pole dezipper cutoff for pitch/morph/timbre
+static constexpr int   kSyncXfadeSamples = 8;      // short crossfade after reset to avoid clicks smoothing (~30 ms)
 static constexpr float kSpreadCurveExp   = 1.60f;  // >1 = gentler near max
 
 // Envelope follower feel (LED & AUX)
@@ -93,15 +97,24 @@ static constexpr Pin  SYNC_PIN        = D19;
 static constexpr bool SYNC_ACTIVE_LOW = true;
 
 // ======================= IO State =========================
-AdcChannelConfig adc_cfg[6]; // 4 direct + 2 mux
+// ADC channel indices (Seed ADC)
+#define CV_TIMBRE 0  // A0
+#define CV_VOCT   1  // A1
+#define CV_SPREAD 2  // A2
+#define CV_MORPH  3  // A3
+#define GATE_IN_1 4  // A4 / ADC4 (active-low via NPN)
+#define MUX1_IDX  5  // pots (MUX1)
+#define MUX2_IDX  6  // attenuverters (MUX2)
+
+AdcChannelConfig adc_cfg[7]; // 5 direct (A0..A4) + 2 mux
 static DacHandle dac;
-static GPIO      sync_in;    // SSYNC digital input (note: GPIO, not Gpio)
 
 // Direct CVs (raw 0..1)
 static float cv_timbre_raw = 0.f; // A0
 static float cv_voct_raw   = 0.f; // A1
 static float cv_spread_raw = 0.f; // A2
 static float cv_morph_raw  = 0.f; // A3
+static float cv_gate_raw   = 1.f; // A4 (active-low via NPN)
 
 // Pots via MUX1
 static float kPitch  = 0.f;
@@ -139,7 +152,16 @@ static float spread_smooth = 0.f;
 static float spread_alpha  = 0.f;
 
 // SSYNC edge tracking
-static bool sync_prev = true;
+static bool sync_prev = true; // idle (high) for active-low
+static bool gate_state = false; // decoded gate (true when asserted)
+static constexpr float kGateLoTh = 0.25f; // ADC 0..1 thresholds for active-low
+static constexpr float kGateHiTh = 0.45f;
+static int sync_blank = 0;
+
+// Additive phases (for high-morph region); keeps sync coherent
+static float add_phase[kMaxVoices] = {0};
+static float voice_prev[kMaxVoices] = {0};
+static int   sync_xfade_cnt[kMaxVoices] = {0};
 
 // DaisySP oscillator cores per voice
 static Oscillator osc_sin[kMaxVoices];
@@ -147,12 +169,23 @@ static Oscillator osc_tri[kMaxVoices];
 static Oscillator osc_saw[kMaxVoices];
 static Oscillator osc_sqr[kMaxVoices];
 static Wavefolder folder_unit[kMaxVoices];
-// Use the same cap as kAddMaxHarm for template param
-template<int N> struct HarmWrap { using Type = HarmonicOscillator<N>; };
-static HarmonicOscillator<kAddMaxHarm> harm[kMaxVoices];
- // idle (high) for active-low
+
+
+static constexpr float kJackLearnSec  = 0.20f;  // learn unplug baseline on boot
+static constexpr float kJackTol       = 0.06f;  // +/- tolerance vs baseline (0..1)
+static constexpr float kJackQuietDz   = 0.002f; // derivative threshold for 'quiet'
+static constexpr float CTRL_MS        = 1.0f;   // control loop period (ms)
+
+// Jack detect state (A0..A3 only)
+static float cv_ref_unplug[4] = {0};
+static float cv_prev_raw[4]   = {0};
+static bool  cv_is_patched[4] = {false,false,false,false};
+static bool  jack_ref_learned = false;
+static uint32_t jack_learn_count = 0;
 
 // ======================= Helpers ==========================
+// Dezipper states for fast smoothing of control steps
+static float pitch01_z = 0.f, morph_z = 0.f, timbre_z = 0.f;
 static inline float clamp01(float x){ return x < 0.f ? 0.f : (x > 1.f ? 1.f : x); }
 static inline float lerp(float a, float b, float t){ return a + t * (b - a); }
 static inline float apply_uni(float cv01, float pol){ return (pol >= 0.f) ? cv01 : (1.f - cv01); }
@@ -276,7 +309,12 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 {
     (void)in;
     const float sr = hw.AudioSampleRate();
+    const float dezipper_alpha = 1.f - expf(-2.f * M_PI * (kParamDezipperHz / sr));
 
+    // --- FM config (local to AudioCb) ---
+    constexpr bool  FM_ENABLED         = true;
+    constexpr bool  FM_EXPO            = true;
+    constexpr float FM_DEPTH_SEMITONES = 7.0f;
     // ---- Control values ----
     const float basePitch   = kPitch;
     const float baseMorph   = kMorph;
@@ -291,7 +329,7 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
 
     // baselines (mainly helpful for pitch drift)
     track_baseline(cvTimbre, cv_timbre_base);
-    track_baseline(cvVoct,   cv_voct_base);
+    if(kVoctBaselineAlpha > 0.f) { cv_voct_base += kVoctBaselineAlpha * (cvVoct - cv_voct_base); }
     track_baseline(cvMorph,  cv_morph_base);
 
     // attenuverters → bipolar
@@ -301,24 +339,33 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     float avMorph  = uni_to_bi(stretch01(at_morph,  kMuxLo, kMuxHi));
 
     // pitch
-    const float pitch01 = clamp01(basePitch + avPitch * (cvVoct - cv_voct_base));
-    const float baseHz  = 50.f + pitch01 * 1950.f;
+    // --- Pitch with attenuverter ---
+    // Convert V/Oct CV to bipolar around 0.5, apply attenuverter depth
+    // Pitch CV attenuverter path
+    float cv_voct_bi = (cvVoct - cv_voct_base) * 2.0f;   // bipolar around learned baseline
+    float pitch_mod  = avPitch * cv_voct_bi;             // attenuverted external CV
+    const float pitch01_target = clamp01(basePitch + pitch_mod);
 
     // bipolar deltas for full throw
     const float dMorph   = (cvMorph  - 0.5f) * 2.0f;
     const float dTimbre  = (cvTimbre - 0.5f) * 2.0f;
     const float dSpread  = (cvSpread - 0.5f) * 2.0f;
 
-    const float morph    = clamp01(baseMorph  + avMorph  * dMorph);
-    const float timbre   = clamp01(baseTimbre + avTimbre * dTimbre);
+    const float morph_target    = clamp01(baseMorph  + avMorph  * dMorph);
+    const float timbre_target   = clamp01(baseTimbre + avTimbre * dTimbre);
 
-    // Spread with smoothing
+    
+    pitch01_z += dezipper_alpha * (pitch01_target - pitch01_z);
+    morph_z   += dezipper_alpha * (morph_target    - morph_z);
+    timbre_z  += dezipper_alpha * (timbre_target   - timbre_z);
+    const float baseHz  = 50.f + pitch01_z * 1950.f;
+// Spread with smoothing
     const float spread_target = clamp01(baseSpreadK + avSpread * dSpread);
     spread_smooth += spread_alpha * (spread_target - spread_smooth);
     const float spread = spread_smooth;
 
     // Heavy-guard
-    const bool heavy_guard = (spread > kHG_SpreadTh) && (morph > kHG_MorphTh) && (timbre > kHG_TimbreTh);
+    const bool heavy_guard = (spread > kHG_SpreadTh) && (morph_z > kHG_MorphTh) && (timbre_z > kHG_TimbreTh);
 
     // Voices
     const float voices_f     = 1.0f + powf(spread, kSpreadCurveExp) * (float)(kMaxVoices - 1);
@@ -351,94 +398,92 @@ static void AudioCb(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, 
     for(size_t i = 0; i < n; ++i)
     {
         // --- HARD SYNC (GPIO, active-low) ---
-        bool pin_high = sync_in.Read();                        // true = logic HIGH at pin
-        bool sync_now = SYNC_ACTIVE_LOW ? !pin_high : pin_high;
-        bool edge     = SYNC_ACTIVE_LOW ? (sync_prev && !sync_now)
+                // Update gate_state from cv_gate_raw using hysteresis (active-low)
+        if(!gate_state && cv_gate_raw < kGateLoTh) gate_state = true;
+        else if(gate_state && cv_gate_raw > kGateHiTh) gate_state = false;
+        bool sync_now = gate_state;
+        bool edge_raw = SYNC_ACTIVE_LOW ? (sync_prev && !sync_now)
                                         : (!sync_prev && sync_now);
+        bool edge     = edge_raw && (sync_blank == 0);
+        // --- Audio-rate FM from codec input (AUDIO_IN_1 / left) ---
+        float fm_in = in[0][i];
+        float fm_factor = 1.0f;
+        float fm_add_hz = 0.0f;
+        if(FM_ENABLED) {
+            if(FM_EXPO) {
+                float semis = fm_in * FM_DEPTH_SEMITONES;
+                fm_factor = powf(2.f, semis / 12.f);
+            } else {
+                fm_add_hz = fm_in * 100.f;
+            }
+        }
         sync_prev = sync_now;
+        if(sync_blank > 0) --sync_blank;
         if(edge)
         {
             // Reset every oscillator phase right at this sample
-            for(int v = 0; v < kMaxVoices; ++v) {
-            phases[v] = 0.0f; // legacy phase (not used by DaisySP path)
-            osc_sin[v].Reset(0.0f);
-            osc_tri[v].Reset(0.0f);
-            osc_saw[v].Reset(0.0f);
-            osc_sqr[v].Reset(0.0f);
-            // HarmonicOscillator has no Reset; resetting via phase is not exposed.
-            // Reset by briefly toggling freq (no-op) so it continues coherent with others.
-            harm[v].Init(sr);
-        }
+            sync_blank = kSyncBlankSamples;
+            for(int v=0; v<kMaxVoices; ++v) sync_xfade_cnt[v] = kSyncXfadeSamples;
+            for(int v = 0; v < kMaxVoices; ++v) { phases[v] = 0.0f; add_phase[v] = 0.0f; osc_sin[v].Reset(0.0f); osc_tri[v].Reset(0.0f); osc_saw[v].Reset(0.0f); osc_sqr[v].Reset(0.0f); }
         }
 
         // --- Osc block (pre-gain) ---
 // DaisySP implementation with morph sin→tri→saw→square→tri→sin and Timbre mapping
 float mix = 0.f;
-const float pwm = 0.5f + 0.45f * ((timbre - 0.5f) * 2.f); // for square region
-const float idx_m = morph * 5.f;
+const float pwm = 0.5f + 0.45f * ((timbre_z - 0.5f) * 2.f); // for square region
+const float idx_m = morph_z * 5.f;
 int   seg_m = (int)idx_m; if(seg_m > 4) seg_m = 4;
 float t_m   = idx_m - (float)seg_m;
 float ts_m  = smoothstep01(t_m);
 
-// Configure additive amplitudes for "bright" end once per block
-float add_amps[kAddMaxHarm];
-for(int k = 0; k < kAddMaxHarm; ++k) add_amps[k] = 0.0f;
-// k=0 unused by module; k=1 is fundamental (we'll keep it 0 since we add base sine separately)
-// Budget a few upper partials according to add_budget and timbre; gentle 1/k rolloff
-for(int k = 2; k < kAddMaxHarm && k <= add_budget; ++k)
-{
-    float a = (timbre) * (0.5f / (float)k);
-    add_amps[k] = a;
-}
-
+// Configure additive "brightness" amplitudes according to timbre and budget
 for(int v = 0; v < voices_used; ++v)
 {
-    const float f = baseHz * detune_factor[v];
-    // Set frequency per voice
+    float f = (baseHz + fm_add_hz) * fm_factor * detune_factor[v];
+    if(f < 0.1f) f = 0.1f;
     osc_sin[v].SetFreq(f);
     osc_tri[v].SetFreq(f);
     osc_saw[v].SetFreq(f);
     osc_sqr[v].SetFreq(f);
-    harm[v].SetFreq(f);
-    harm[v].SetAmplitudes(add_amps);
-
-    // keep PWM updated (only affects square)
     osc_sqr[v].SetPw(pwm);
 
-    // Get node outputs
     auto node_out = [&](int node)->float {
         switch(node)
         {
             case 0: {
                 float s = osc_sin[v].Process();
-                // Fold intensity via input gain
-                folder_unit[v].SetGain(1.0f + kFoldRange * timbre);
+                folder_unit[v].SetGain(1.0f + kFoldRange * timbre_z);
                 return folder_unit[v].Process(s);
             }
             case 1: {
                 float s = osc_tri[v].Process();
-                folder_unit[v].SetGain(1.0f + kFoldRange * timbre);
+                folder_unit[v].SetGain(1.0f + kFoldRange * timbre_z);
                 return folder_unit[v].Process(s);
             }
             case 2: {
                 float s = osc_saw[v].Process();
-                // Simple brightening: mild drive that increases with timbre
-                float driven = tanhf((1.0f + 0.8f * timbre) * s);
-                return driven;
+                return tanhf((1.0f + 0.8f * timbre_z) * s);
             }
             case 3: {
                 return osc_sqr[v].Process();
             }
             case 4: {
                 float s = osc_tri[v].Process();
-                folder_unit[v].SetGain(1.0f + 0.6f * kFoldRange * timbre);
+                folder_unit[v].SetGain(1.0f + 0.6f * kFoldRange * timbre_z);
                 return folder_unit[v].Process(s);
             }
-            default:
-            case 5: {
+            default: // 5: sine + additive
+            {
+                // advance additive phase in parallel so we can hard-reset it on sync
+                const float inc = f / sr;
+                add_phase[v] += inc; if(add_phase[v] >= 1.f) add_phase[v] -= 1.f;
                 float base = osc_sin[v].Process();
-                float add  = harm[v].Process();
-                // Gentle limiting like original
+                float add  = 0.0f;
+                for(int k = 2; k < kAddMaxHarm && k <= add_budget; ++k)
+                {
+                    float a = (timbre_z) * (0.5f / (float)k);
+                    add += a * sinf(2.f * M_PI * (float)k * add_phase[v]);
+                }
                 return tanhf(0.95f * (base + add));
             }
         }
@@ -448,7 +493,14 @@ for(int v = 0; v < voices_used; ++v)
     float b = node_out(seg_m + 1);
     float sig = lerp(a, b, ts_m);
 
+    // Crossfade after sync reset to avoid hard discontinuity
+    if(sync_xfade_cnt[v] > 0) {
+        float tcf = (float)(kSyncXfadeSamples - sync_xfade_cnt[v]) / (float)kSyncXfadeSamples;
+        sig = (1.0f - tcf) * voice_prev[v] + tcf * sig;
+        --sync_xfade_cnt[v];
+    }
     mix += vweight[v] * sig;
+    voice_prev[v] = sig;
 }
 mix *= (1.0f / wsum);
 
@@ -502,10 +554,11 @@ int main(void)
     adc_cfg[CV_VOCT  ].InitSingle(A1);
     adc_cfg[CV_SPREAD].InitSingle(A2);
     adc_cfg[CV_MORPH ].InitSingle(A3);
-    adc_cfg[4].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2); // pots
-    adc_cfg[5].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2); // attenuverters
+    adc_cfg[4].InitSingle(A4); // CV_GATE
+    adc_cfg[MUX1_IDX].InitMux(MUX1_COM_PIN, 8, MUX1_SEL0, MUX1_SEL1, MUX1_SEL2); // pots
+    adc_cfg[MUX2_IDX].InitMux(MUX2_COM_PIN, 8, MUX2_SEL0, MUX2_SEL1, MUX2_SEL2); // attenuverters
 
-    hw.adc.Init(adc_cfg, 6);
+    hw.adc.Init(adc_cfg, 7);
     hw.adc.Start();
 
     // ----- DAC setup -----
@@ -516,13 +569,10 @@ int main(void)
     dcfg.chn        = DacHandle::Channel::BOTH; // A8 (CH1) + A7 (CH2)
     dac.Init(dcfg);
 
-    // ----- SSYNC GPIO (active-low) -----
-    sync_in.Init(SYNC_PIN, GPIO::Mode::INPUT, GPIO::Pull::NOPULL);
-    sync_prev = true; // idle high for active-low
+    // ----- SSYNC via ADC on A4 -----
 
     const float sr = hw.AudioSampleRate();
-
-    // POST-gain follower (LED/AUX)
+// POST-gain follower (LED/AUX)
     env_atk2 = 1.0f / ((kEnvAtkMs / 1000.f) * sr);
     env_rel2 = 1.0f / ((kEnvRelMs / 1000.f) * sr);
 
@@ -536,32 +586,11 @@ int main(void)
     // DaisySP oscillator init
     for(int v = 0; v < kMaxVoices; ++v)
     {
-        osc_sin[v].Init(sr);
-        osc_sin[v].SetWaveform(Oscillator::WAVE_SIN);
-        osc_sin[v].SetAmp(1.0f);
-
-        osc_tri[v].Init(sr);
-        osc_tri[v].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);
-        osc_tri[v].SetAmp(1.0f);
-
-        osc_saw[v].Init(sr);
-        osc_saw[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);
-        osc_saw[v].SetAmp(1.0f);
-
-        osc_sqr[v].Init(sr);
-        osc_sqr[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE);
-        osc_sqr[v].SetAmp(1.0f);
-        osc_sqr[v].SetPw(0.5f);
-
-        folder_unit[v].Init();
-        folder_unit[v].SetGain(1.0f);
-        folder_unit[v].SetOffset(0.0f);
-
-        harm[v].Init(sr);
-        harm[v].SetFirstHarmIdx(1); // fundamental at index 1
-        // Default amplitudes all zeros
-        float amps[kAddMaxHarm] = {0};
-        harm[v].SetAmplitudes(amps);
+        osc_sin[v].Init(sr);  osc_sin[v].SetWaveform(Oscillator::WAVE_SIN);             osc_sin[v].SetAmp(1.0f);
+        osc_tri[v].Init(sr);  osc_tri[v].SetWaveform(Oscillator::WAVE_POLYBLEP_TRI);    osc_tri[v].SetAmp(1.0f);
+        osc_saw[v].Init(sr);  osc_saw[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SAW);    osc_saw[v].SetAmp(1.0f);
+        osc_sqr[v].Init(sr);  osc_sqr[v].SetWaveform(Oscillator::WAVE_POLYBLEP_SQUARE); osc_sqr[v].SetAmp(1.0f); osc_sqr[v].SetPw(0.5f);
+        folder_unit[v].Init(); folder_unit[v].SetGain(1.0f); folder_unit[v].SetOffset(0.0f);
     }
 
 
@@ -571,22 +600,46 @@ int main(void)
     while (1)
     {
         // Direct CVs (raw 0..1)
-        cv_timbre_raw = hw.adc.GetFloat(CV_TIMBRE);
-        cv_voct_raw   = hw.adc.GetFloat(CV_VOCT);
-        cv_spread_raw = hw.adc.GetFloat(CV_SPREAD);
-        cv_morph_raw  = hw.adc.GetFloat(CV_MORPH);
+        cv_timbre_raw = hw.adc.GetFloat(CV_TIMBRE);        // no inversion
+        cv_voct_raw   = hw.adc.GetFloat(CV_VOCT);          // no inversion
+        cv_spread_raw = 1.0f - hw.adc.GetFloat(CV_SPREAD); // inverted
+        cv_morph_raw  = 1.0f - hw.adc.GetFloat(CV_MORPH);  // inverted
+        cv_gate_raw   = 1.0f - hw.adc.GetFloat(GATE_IN_1); // inverted (active-low)
+
+
+        // --- Jack reference learn (~200ms) and detect (A0..A3) ---
+        {
+            float raws[4] = {cv_timbre_raw, cv_voct_raw, cv_spread_raw, cv_morph_raw};
+            if(!jack_ref_learned) {
+                const float alpha = 0.02f; // slow LPF for baseline learn
+                for(int c=0;c<4;++c) cv_ref_unplug[c] += alpha * (raws[c] - cv_ref_unplug[c]);
+                ++jack_learn_count;
+                if(jack_learn_count > (uint32_t)(kJackLearnSec * 1000.f / CTRL_MS)) jack_ref_learned = true;
+            } else {
+                for(int c=0;c<4;++c) {
+                    float dv   = fabsf(raws[c] - cv_prev_raw[c]);
+                    float diff = fabsf(raws[c] - cv_ref_unplug[c]);
+                    bool quiet   = dv   < kJackQuietDz;
+                    bool nearref = diff < kJackTol;
+                    cv_is_patched[c] = !(nearref && quiet);
+                    cv_prev_raw[c]   = raws[c];
+                }
+            }
+        }
+
+        cv_gate_raw = hw.adc.GetFloat(GATE_IN_1); // A4
 
         // MUX1 (pots)
-        kPitch  = hw.adc.GetMuxFloat(4, CH_PITCH);
-        kMorph  = hw.adc.GetMuxFloat(4, CH_MORPH);
-        kSpread = hw.adc.GetMuxFloat(4, CH_SPREAD);
-        kTimbre = hw.adc.GetMuxFloat(4, CH_TIMBRE);
+        kPitch  = hw.adc.GetMuxFloat(MUX1_IDX, CH_PITCH);
+        kMorph  = hw.adc.GetMuxFloat(MUX1_IDX, CH_MORPH);
+        kSpread = hw.adc.GetMuxFloat(MUX1_IDX, CH_SPREAD);
+        kTimbre = hw.adc.GetMuxFloat(MUX1_IDX, CH_TIMBRE);
 
         // MUX2 (attenuverters)
-        at_timbre = hw.adc.GetMuxFloat(5, AT_CH_TIMBRE);
-        at_pitch  = hw.adc.GetMuxFloat(5, AT_CH_PITCH);
-        at_spread = hw.adc.GetMuxFloat(5, AT_CH_SPREAD);
-        at_morph  = hw.adc.GetMuxFloat(5, AT_CH_MORPH);
+        at_timbre = hw.adc.GetMuxFloat(MUX2_IDX, AT_CH_TIMBRE);
+        at_pitch  = hw.adc.GetMuxFloat(MUX2_IDX, AT_CH_PITCH);
+        at_spread = hw.adc.GetMuxFloat(MUX2_IDX, AT_CH_SPREAD);
+        at_morph  = hw.adc.GetMuxFloat(MUX2_IDX, AT_CH_MORPH);
 
         System::Delay(1);
     }
